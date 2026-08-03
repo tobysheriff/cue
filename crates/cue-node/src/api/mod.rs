@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use argon2::Params;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -20,9 +21,12 @@ use axum::routing::{get, post};
 use axum::Router;
 use cue_crypto::sessions::PublicKey;
 use cue_proto::v1::{
-    OneTimePrekey, PrekeyBundleResponse, RegisterRequest, RegisterResponse, RegistrationChallenge,
-    RerollHandleRequest, RerollHandleResponse, SignedPrekey,
+    AckRequest, Envelope, MailboxEnvelopes, OneTimePrekey, PrekeyBundleResponse, RegisterRequest,
+    RegisterResponse, RegistrationChallenge, RerollHandleRequest, RerollHandleResponse,
+    SignedPrekey, SizeBucket,
 };
+use prost::Message as _;
+use tokio::sync::broadcast;
 
 use crate::accounts::handle::{self, Handle, FREE_REROLLS_AT_SIGNUP};
 use crate::accounts::pow::{ChallengeId, PowChallengeStore};
@@ -31,6 +35,7 @@ use crate::accounts::store::{
     SignedPrekeyRecord as StoredSignedPrekey, StoreError,
 };
 use crate::accounts::trust::TrustLevel;
+use crate::delivery::mailbox::{EnvelopeId, MailboxId, MailboxStore};
 use crate::ingress::reputation::{BucketKey, IngressDecision, ReputationTable, RotatingSecret};
 
 pub use captcha::{CaptchaVerifier, NullCaptchaVerifier};
@@ -74,6 +79,7 @@ pub struct AppState {
     pending: Mutex<HashMap<ChallengeId, PendingChallenge>>,
     accounts: Box<dyn AccountStore>,
     captcha: Box<dyn CaptchaVerifier>,
+    mailboxes: Box<dyn MailboxStore>,
     config: RegistrationConfig,
 }
 
@@ -81,6 +87,7 @@ impl AppState {
     pub fn new(
         accounts: Box<dyn AccountStore>,
         captcha: Box<dyn CaptchaVerifier>,
+        mailboxes: Box<dyn MailboxStore>,
         config: RegistrationConfig,
     ) -> Self {
         Self {
@@ -90,8 +97,16 @@ impl AppState {
             pending: Mutex::new(HashMap::new()),
             accounts,
             captcha,
+            mailboxes,
             config,
         }
+    }
+
+    /// Drop every envelope past its hard 30-day TTL (docs/09), across all
+    /// mailboxes. Called on a periodic tick from `main`; exposed here so
+    /// the caller doesn't need to reach into `mailboxes` directly.
+    pub fn sweep_expired_envelopes(&self) -> usize {
+        self.mailboxes.sweep_expired()
     }
 }
 
@@ -101,6 +116,10 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/v1/register", post(register))
         .route("/v1/register/reroll", post(reroll_handle))
         .route("/v1/accounts/{handle}/prekey-bundle", get(prekey_bundle))
+        .route("/v1/deliver", post(deliver))
+        .route("/v1/mailbox/{mailbox_id}", get(fetch_mailbox))
+        .route("/v1/mailbox/{mailbox_id}/ack", post(ack_mailbox))
+        .route("/v1/mailbox/{mailbox_id}/ws", get(mailbox_ws))
         .with_state(state)
 }
 
@@ -222,6 +241,7 @@ async fn register(
 
     let device = DeviceRecord {
         identity_key: req.identity_key,
+        registration_id: req.registration_id,
         signed_prekey,
         kyber_prekey,
         one_time_prekeys,
@@ -329,6 +349,8 @@ async fn prekey_bundle(
         signed_prekey: Some(signed_prekey_to_wire(&primary_device.signed_prekey)),
         kyber_prekey: Some(signed_prekey_to_wire(&primary_device.kyber_prekey)),
         one_time_prekey,
+        mailbox_id: primary_device.mailbox_id.to_vec(),
+        registration_id: primary_device.registration_id,
     }))
 }
 
@@ -337,6 +359,173 @@ fn signed_prekey_to_wire(record: &StoredSignedPrekey) -> SignedPrekey {
         id: record.id,
         public_key: record.public_key.clone(),
         signature: record.signature.clone(),
+    }
+}
+
+/// The exact ciphertext length a `size_bucket` claim commits to (docs/04
+/// "fixed-size padded envelopes"). `delivery` rejects anything that
+/// doesn't match rather than accepting whatever length shows up — a
+/// mismatched bucket is either a broken client or an attempt to leak
+/// message length past the padding scheme.
+fn expected_ciphertext_len(bucket: SizeBucket) -> Option<usize> {
+    match bucket {
+        SizeBucket::B1kb => Some(1024),
+        SizeBucket::B4kb => Some(4 * 1024),
+        SizeBucket::B16kb => Some(16 * 1024),
+        SizeBucket::B64kb => Some(64 * 1024),
+        SizeBucket::Unspecified => None,
+    }
+}
+
+fn mailbox_id_from_hex(text: &str) -> Result<MailboxId, ApiError> {
+    if text.len() != 32 {
+        return Err(ApiError::BadRequest(
+            "mailbox_id must be 32 hex characters".into(),
+        ));
+    }
+    let mut bytes = [0u8; 16];
+    for (i, pair) in text.as_bytes().chunks(2).enumerate() {
+        let byte = std::str::from_utf8(pair)
+            .ok()
+            .and_then(|s| u8::from_str_radix(s, 16).ok())
+            .ok_or_else(|| ApiError::BadRequest("mailbox_id must be hex".into()))?;
+        bytes[i] = byte;
+    }
+    Ok(MailboxId::from_bytes(bytes))
+}
+
+/// `POST /v1/deliver` — enqueue one envelope (docs/05 delivery pipeline's
+/// "validate envelope shape + padding bucket" then "enqueue to recipient
+/// mailbox"). The Node never inspects `mailbox_id` against `accounts`: it
+/// is an opaque routing key, and validating it against a real account
+/// would be exactly the correlation sealed mailboxes exist to prevent.
+async fn deliver(
+    State(state): State<std::sync::Arc<AppState>>,
+    Protobuf(envelope): Protobuf<Envelope>,
+) -> Result<StatusCode, ApiError> {
+    let bucket = SizeBucket::try_from(envelope.size_bucket)
+        .map_err(|_| ApiError::BadRequest("unknown size_bucket".into()))?;
+    let expected_len = expected_ciphertext_len(bucket)
+        .ok_or_else(|| ApiError::BadRequest("size_bucket must be set".into()))?;
+    if envelope.ciphertext.len() != expected_len {
+        return Err(ApiError::BadRequest(
+            "ciphertext length does not match size_bucket".into(),
+        ));
+    }
+
+    let mailbox_id_bytes: [u8; 16] = envelope
+        .mailbox_id
+        .as_slice()
+        .try_into()
+        .map_err(|_| ApiError::BadRequest("mailbox_id must be 16 bytes".into()))?;
+
+    state
+        .mailboxes
+        .enqueue(MailboxId::from_bytes(mailbox_id_bytes), envelope);
+
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// `GET /v1/mailbox/{mailbox_id}` — peek at what's currently queued,
+/// without deleting anything (docs/09: only an ack deletes). Phase 1's
+/// polling fallback alongside `mailbox_ws`'s live push.
+async fn fetch_mailbox(
+    State(state): State<std::sync::Arc<AppState>>,
+    Path(mailbox_id_hex): Path<String>,
+) -> Result<Protobuf<MailboxEnvelopes>, ApiError> {
+    let mailbox_id = mailbox_id_from_hex(&mailbox_id_hex)?;
+    Ok(Protobuf(MailboxEnvelopes {
+        envelopes: state.mailboxes.fetch(&mailbox_id),
+    }))
+}
+
+/// `POST /v1/mailbox/{mailbox_id}/ack` — delete-on-ack (docs/09 "deliver
+/// and delete"). Unknown ids are a silent no-op, matching
+/// [`MailboxStore::ack`].
+async fn ack_mailbox(
+    State(state): State<std::sync::Arc<AppState>>,
+    Path(mailbox_id_hex): Path<String>,
+    Protobuf(req): Protobuf<AckRequest>,
+) -> Result<StatusCode, ApiError> {
+    let mailbox_id = mailbox_id_from_hex(&mailbox_id_hex)?;
+    for envelope_id in req.envelope_ids {
+        let id_bytes: [u8; 16] = envelope_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| ApiError::BadRequest("envelope_id must be 16 bytes".into()))?;
+        state
+            .mailboxes
+            .ack(&mailbox_id, &EnvelopeId::from_bytes(id_bytes));
+    }
+    Ok(StatusCode::OK)
+}
+
+/// `GET /v1/mailbox/{mailbox_id}/ws` — the long-lived connection docs/05's
+/// delivery pipeline fans out to. On connect: flush whatever's already
+/// queued, then push new envelopes live as they're enqueued. Each
+/// server→client frame is one protobuf-encoded [`Envelope`]; each
+/// client→server frame is one 16-byte envelope_id to ack.
+async fn mailbox_ws(
+    State(state): State<std::sync::Arc<AppState>>,
+    Path(mailbox_id_hex): Path<String>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    let mailbox_id = mailbox_id_from_hex(&mailbox_id_hex)?;
+    Ok(ws.on_upgrade(move |socket| handle_mailbox_socket(state, mailbox_id, socket)))
+}
+
+async fn handle_mailbox_socket(
+    state: std::sync::Arc<AppState>,
+    mailbox_id: MailboxId,
+    mut socket: WebSocket,
+) {
+    // Subscribe before draining the current queue: an envelope enqueued
+    // between `fetch` and `subscribe` would otherwise be missed by both.
+    let mut live = state.mailboxes.subscribe(mailbox_id);
+
+    for envelope in state.mailboxes.fetch(&mailbox_id) {
+        if socket
+            .send(Message::Binary(envelope.encode_to_vec().into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    loop {
+        tokio::select! {
+            pushed = live.recv() => {
+                match pushed {
+                    Ok(envelope) => {
+                        if socket.send(Message::Binary(envelope.encode_to_vec().into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    // Missed some live pushes; the next `fetch` (or this
+                    // connection's next successful recv) still sees
+                    // everything undelivered, so just keep going.
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    // The channel is genuinely gone — `recv` would return
+                    // `Closed` immediately forever, so looping on it would
+                    // busy-spin. Nothing more can arrive live; end the task
+                    // rather than hold the socket open uselessly.
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        if let Ok(id_bytes) = <[u8; 16]>::try_from(bytes.as_ref()) {
+                            state.mailboxes.ack(&mailbox_id, &EnvelopeId::from_bytes(id_bytes));
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => return,
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => return,
+                }
+            }
+        }
     }
 }
 
@@ -370,6 +559,7 @@ mod tests {
         Arc::new(AppState::new(
             Box::new(InMemoryAccountStore::new()),
             Box::new(NullCaptchaVerifier),
+            Box::new(crate::delivery::mailbox::InMemoryMailboxStore::new()),
             RegistrationConfig {
                 argon2_params: Params::new(8, 1, 1, Some(32)).unwrap(),
                 base_difficulty_bits: 4,
@@ -451,6 +641,7 @@ mod tests {
             signed_prekey: Some(signed_prekey.clone()),
             kyber_prekey: Some(kyber_prekey.clone()),
             one_time_prekeys: vec![one_time_prekey.clone()],
+            registration_id: identity.registration_id,
         };
 
         let request = Request::builder()
@@ -589,6 +780,7 @@ mod tests {
         let state = Arc::new(AppState::new(
             Box::new(InMemoryAccountStore::new()),
             Box::new(NullCaptchaVerifier),
+            Box::new(crate::delivery::mailbox::InMemoryMailboxStore::new()),
             RegistrationConfig {
                 argon2_params: Params::new(8, 1, 1, Some(32)).unwrap(),
                 base_difficulty_bits: 200,
@@ -625,5 +817,510 @@ mod tests {
             escalated.captcha_required,
             "repeated PoW failures from one bucket escalate to a captcha requirement"
         );
+    }
+
+    fn sample_envelope(mailbox_id: [u8; 16]) -> Envelope {
+        Envelope {
+            version: 1,
+            mailbox_id: mailbox_id.to_vec(),
+            size_bucket: SizeBucket::B1kb as i32,
+            ciphertext: vec![0x42; 1024],
+            envelope_id: vec![],
+        }
+    }
+
+    fn to_hex(bytes: &[u8; 16]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[tokio::test]
+    async fn deliver_fetch_and_ack_round_trip_through_the_http_surface() {
+        let state = test_state();
+        let router = router(state.clone());
+        let mailbox_id = [9u8; 16];
+
+        let deliver_request = Request::builder()
+            .method("POST")
+            .uri("/v1/deliver")
+            .header("content-type", "application/x-protobuf")
+            .body(Body::from(sample_envelope(mailbox_id).encode_to_vec()))
+            .unwrap();
+        let response = router.clone().oneshot(deliver_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let fetch_request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/mailbox/{}", to_hex(&mailbox_id)))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(fetch_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let fetched: MailboxEnvelopes = decode(response).await;
+        assert_eq!(fetched.envelopes.len(), 1);
+        let envelope_id = fetched.envelopes[0].envelope_id.clone();
+        assert_eq!(
+            envelope_id.len(),
+            16,
+            "delivery assigned a real envelope_id"
+        );
+
+        let ack_request = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/mailbox/{}/ack", to_hex(&mailbox_id)))
+            .header("content-type", "application/x-protobuf")
+            .body(Body::from(
+                AckRequest {
+                    envelope_ids: vec![envelope_id],
+                }
+                .encode_to_vec(),
+            ))
+            .unwrap();
+        let response = router.clone().oneshot(ack_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let refetch_request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/mailbox/{}", to_hex(&mailbox_id)))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(refetch_request).await.unwrap();
+        let refetched: MailboxEnvelopes = decode(response).await;
+        assert!(
+            refetched.envelopes.is_empty(),
+            "acked envelope is deleted, not just marked"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_rejects_a_ciphertext_length_that_does_not_match_its_size_bucket() {
+        let state = test_state();
+        let router = router(state.clone());
+
+        let mut envelope = sample_envelope([1u8; 16]);
+        envelope.ciphertext = vec![0; 999]; // not any bucket's exact size
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/deliver")
+            .header("content-type", "application/x-protobuf")
+            .body(Body::from(envelope.encode_to_vec()))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn deliver_rejects_an_unspecified_size_bucket() {
+        let state = test_state();
+        let router = router(state.clone());
+
+        let mut envelope = sample_envelope([1u8; 16]);
+        envelope.size_bucket = SizeBucket::Unspecified as i32;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/deliver")
+            .header("content-type", "application/x-protobuf")
+            .body(Body::from(envelope.encode_to_vec()))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn deliver_rejects_a_mailbox_id_that_is_not_sixteen_bytes() {
+        let state = test_state();
+        let router = router(state.clone());
+
+        let mut envelope = sample_envelope([1u8; 16]);
+        envelope.mailbox_id = vec![0xAB; 4]; // too short
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/deliver")
+            .header("content-type", "application/x-protobuf")
+            .body(Body::from(envelope.encode_to_vec()))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn deliver_overwrites_a_sender_supplied_envelope_id_end_to_end() {
+        let state = test_state();
+        let router = router(state.clone());
+        let mailbox_id = [3u8; 16];
+
+        let mut envelope = sample_envelope(mailbox_id);
+        envelope.envelope_id = vec![0xFF; 16];
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/deliver")
+            .header("content-type", "application/x-protobuf")
+            .body(Body::from(envelope.encode_to_vec()))
+            .unwrap();
+        assert_eq!(
+            router.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::ACCEPTED
+        );
+
+        let fetch_request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/mailbox/{}", to_hex(&mailbox_id)))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(fetch_request).await.unwrap();
+        let fetched: MailboxEnvelopes = decode(response).await;
+
+        assert_eq!(fetched.envelopes.len(), 1);
+        assert_eq!(fetched.envelopes[0].envelope_id.len(), 16);
+        assert_ne!(
+            fetched.envelopes[0].envelope_id,
+            vec![0xFF; 16],
+            "the client-supplied envelope_id must not survive the wire round trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_and_ack_reject_a_malformed_mailbox_id_path_segment() {
+        let state = test_state();
+        let router = router(state.clone());
+
+        for uri in [
+            "/v1/mailbox/not-hex-at-all-xxxxxxxxxxxxxxxx".to_string(),
+            "/v1/mailbox/abcd".to_string(), // too short
+        ] {
+            let request = Request::builder()
+                .method("GET")
+                .uri(uri.clone())
+                .body(Body::empty())
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "GET {uri} should reject a malformed mailbox_id"
+            );
+        }
+
+        let ack_request = Request::builder()
+            .method("POST")
+            .uri("/v1/mailbox/zz/ack")
+            .header("content-type", "application/x-protobuf")
+            .body(Body::from(AckRequest::default().encode_to_vec()))
+            .unwrap();
+        let response = router.clone().oneshot(ack_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let ws_request = Request::builder()
+            .method("GET")
+            .uri("/v1/mailbox/zz/ws")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(ws_request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "a malformed mailbox_id is rejected before any WebSocket upgrade is attempted"
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_id_hex_parsing_is_case_insensitive() {
+        let state = test_state();
+        let router = router(state.clone());
+        let mailbox_id = [0xABu8; 16];
+
+        let deliver_request = Request::builder()
+            .method("POST")
+            .uri("/v1/deliver")
+            .header("content-type", "application/x-protobuf")
+            .body(Body::from(sample_envelope(mailbox_id).encode_to_vec()))
+            .unwrap();
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(deliver_request)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::ACCEPTED
+        );
+
+        let uppercase_hex: String = to_hex(&mailbox_id).to_uppercase();
+        let fetch_request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/mailbox/{uppercase_hex}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(fetch_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let fetched: MailboxEnvelopes = decode(response).await;
+        assert_eq!(fetched.envelopes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ack_rejects_an_envelope_id_that_is_not_sixteen_bytes() {
+        let state = test_state();
+        let router = router(state.clone());
+        let mailbox_id = [5u8; 16];
+
+        let ack_request = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/mailbox/{}/ack", to_hex(&mailbox_id)))
+            .header("content-type", "application/x-protobuf")
+            .body(Body::from(
+                AckRequest {
+                    envelope_ids: vec![vec![0x01, 0x02, 0x03]],
+                }
+                .encode_to_vec(),
+            ))
+            .unwrap();
+        let response = router.clone().oneshot(ack_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn two_registered_accounts_exchange_an_envelope_through_registration_and_delivery() {
+        // The Phase 1 exit criterion end to end at the API layer: alice
+        // learns bob's mailbox_id from his prekey bundle (docs/03 "session
+        // establishment"), addresses an envelope to it, and bob retrieves
+        // and acks it (docs/09 "deliver and delete"). Actual E2EE content
+        // is cue-core's job; this proves the two Node-side halves wire
+        // together correctly.
+        let state = test_state();
+        let router = router(state.clone());
+
+        let _alice = register_one(&router, &state).await;
+        let bob = register_one(&router, &state).await;
+
+        let bundle_request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/accounts/{}/prekey-bundle", bob.handle))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(bundle_request).await.unwrap();
+        let bundle: PrekeyBundleResponse = decode(response).await;
+        assert_eq!(
+            bundle.mailbox_id.len(),
+            16,
+            "bundle carries a routable mailbox_id"
+        );
+
+        let mailbox_id: [u8; 16] = bundle.mailbox_id.clone().try_into().unwrap();
+        let deliver_request = Request::builder()
+            .method("POST")
+            .uri("/v1/deliver")
+            .header("content-type", "application/x-protobuf")
+            .body(Body::from(sample_envelope(mailbox_id).encode_to_vec()))
+            .unwrap();
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(deliver_request)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::ACCEPTED
+        );
+
+        let fetch_request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/mailbox/{}", to_hex(&mailbox_id)))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(fetch_request).await.unwrap();
+        let fetched: MailboxEnvelopes = decode(response).await;
+        assert_eq!(fetched.envelopes.len(), 1);
+        assert_eq!(fetched.envelopes[0].ciphertext, vec![0x42; 1024]);
+
+        let ack_request = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/mailbox/{}/ack", to_hex(&mailbox_id)))
+            .header("content-type", "application/x-protobuf")
+            .body(Body::from(
+                AckRequest {
+                    envelope_ids: vec![fetched.envelopes[0].envelope_id.clone()],
+                }
+                .encode_to_vec(),
+            ))
+            .unwrap();
+        assert_eq!(
+            router.clone().oneshot(ack_request).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let refetch_request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/mailbox/{}", to_hex(&mailbox_id)))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(refetch_request).await.unwrap();
+        let refetched: MailboxEnvelopes = decode(response).await;
+        assert!(
+            refetched.envelopes.is_empty(),
+            "bob's ack deleted it on the Node"
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_websocket_flushes_queued_envelopes_then_pushes_live_ones_and_honours_acks() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        let state = test_state();
+        let mailbox_id_bytes = [42u8; 16];
+        let mailbox_id = MailboxId::from_bytes(mailbox_id_bytes);
+
+        // Queued before the socket ever connects.
+        let queued_id = state
+            .mailboxes
+            .enqueue(mailbox_id, sample_envelope(mailbox_id_bytes));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        let url = format!("ws://{}/v1/mailbox/{}/ws", addr, to_hex(&mailbox_id_bytes));
+        let (mut ws, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("websocket connects");
+
+        let flushed = ws.next().await.expect("stream open").expect("no error");
+        let WsMessage::Binary(bytes) = flushed else {
+            panic!("expected a binary frame for the queued envelope")
+        };
+        let envelope = Envelope::decode(bytes.as_ref()).expect("valid envelope");
+        assert_eq!(
+            envelope.envelope_id,
+            queued_id.as_bytes().to_vec(),
+            "already-queued envelope is flushed on connect"
+        );
+
+        // Live push after the socket is already connected.
+        let live_id = state
+            .mailboxes
+            .enqueue(mailbox_id, sample_envelope(mailbox_id_bytes));
+        let pushed = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("live push arrives before the timeout")
+            .expect("stream open")
+            .expect("no error");
+        let WsMessage::Binary(bytes) = pushed else {
+            panic!("expected a binary frame for the live envelope")
+        };
+        let envelope = Envelope::decode(bytes.as_ref()).expect("valid envelope");
+        assert_eq!(envelope.envelope_id, live_id.as_bytes().to_vec());
+
+        // Acking over the socket deletes from the store, same as the REST ack.
+        ws.send(WsMessage::Binary(queued_id.as_bytes().to_vec().into()))
+            .await
+            .expect("send ack frame");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let remaining = state.mailboxes.fetch(&mailbox_id);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].envelope_id, live_id.as_bytes().to_vec());
+    }
+
+    #[tokio::test]
+    async fn mailbox_websocket_ignores_a_malformed_ack_frame_and_keeps_streaming() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        let state = test_state();
+        let mailbox_id_bytes = [11u8; 16];
+        let mailbox_id = MailboxId::from_bytes(mailbox_id_bytes);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        let url = format!("ws://{}/v1/mailbox/{}/ws", addr, to_hex(&mailbox_id_bytes));
+        let (mut ws, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("websocket connects");
+
+        // Neither a text frame nor a too-short binary frame is a valid ack;
+        // the connection must survive both rather than dropping.
+        ws.send(WsMessage::Text("not an envelope_id".into()))
+            .await
+            .expect("send text frame");
+        ws.send(WsMessage::Binary(vec![0x01, 0x02].into()))
+            .await
+            .expect("send undersized binary frame");
+
+        let live_id = state
+            .mailboxes
+            .enqueue(mailbox_id, sample_envelope(mailbox_id_bytes));
+        let pushed = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("connection still alive and delivers the live push")
+            .expect("stream open")
+            .expect("no error");
+        let WsMessage::Binary(bytes) = pushed else {
+            panic!("expected a binary frame for the live envelope")
+        };
+        let envelope = Envelope::decode(bytes.as_ref()).expect("valid envelope");
+        assert_eq!(envelope.envelope_id, live_id.as_bytes().to_vec());
+    }
+
+    #[tokio::test]
+    async fn mailbox_websocket_fans_out_a_live_envelope_to_every_connected_device() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        let state = test_state();
+        let mailbox_id_bytes = [77u8; 16];
+        let mailbox_id = MailboxId::from_bytes(mailbox_id_bytes);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        let url = format!("ws://{}/v1/mailbox/{}/ws", addr, to_hex(&mailbox_id_bytes));
+        let (mut first_device, _) = tokio_tungstenite::connect_async(url.clone())
+            .await
+            .expect("first device connects");
+        let (mut second_device, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("second device connects");
+
+        // Give both sockets a moment to complete their subscribe() before
+        // the live push, since subscribing is what makes fan-out possible.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let pushed_id = state
+            .mailboxes
+            .enqueue(mailbox_id, sample_envelope(mailbox_id_bytes));
+
+        for device in [&mut first_device, &mut second_device] {
+            let received = tokio::time::timeout(Duration::from_secs(2), device.next())
+                .await
+                .expect("each connected device receives the fan-out")
+                .expect("stream open")
+                .expect("no error");
+            let WsMessage::Binary(bytes) = received else {
+                panic!("expected a binary frame")
+            };
+            let envelope = Envelope::decode(bytes.as_ref()).expect("valid envelope");
+            assert_eq!(envelope.envelope_id, pushed_id.as_bytes().to_vec());
+        }
     }
 }

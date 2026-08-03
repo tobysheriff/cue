@@ -62,13 +62,17 @@ pub struct OneTimePrekeyRecord {
 #[derive(Debug, Clone)]
 pub struct DeviceRecord {
     pub identity_key: Vec<u8>,
+    /// libsignal's own registration id (docs/03 "Session establishment:
+    /// PQXDH") — opaque to the Node, required by a peer reconstructing a
+    /// `PreKeyBundle` from `prekey_bundle`'s response.
+    pub registration_id: u32,
     pub signed_prekey: SignedPrekeyRecord,
     pub kyber_prekey: SignedPrekeyRecord,
     pub one_time_prekeys: Vec<OneTimePrekeyRecord>,
-    /// Opaque, epoch-rotating mailbox identifier (docs/04 #3). Actual daily
-    /// epoch rotation, and routing envelopes by it, is `delivery`'s job once
-    /// it exists; registration only mints the first value.
-    #[allow(dead_code)]
+    /// Opaque, epoch-rotating mailbox identifier (docs/04 #3). Registration
+    /// only mints the first value and `delivery` routes on it as-is; daily
+    /// epoch rotation is still a Phase 3 gap (see `PrekeyBundleResponse`'s
+    /// `mailbox_id` doc comment).
     pub mailbox_id: [u8; 16],
     #[allow(dead_code)]
     pub linked_week: u32,
@@ -303,6 +307,7 @@ mod tests {
         let id = record.account_id;
         record.devices.push(DeviceRecord {
             identity_key: vec![1, 2, 3],
+            registration_id: 42,
             signed_prekey: SignedPrekeyRecord {
                 id: 1,
                 public_key: vec![4, 5, 6],

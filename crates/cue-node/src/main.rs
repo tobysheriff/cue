@@ -1,29 +1,14 @@
-//! The Cue Node server binary (docs/05).
-//!
-//! Design constraints, in priority order: forget by default, operable by
-//! one person, readable by an auditor who doesn't trust us, boring
-//! dependencies. Every module below carries a doc comment stating what it
-//! must never do — that comment is a security control, not decoration.
+//! The Cue Node server binary entry point — see `lib.rs` for the crate's
+//! own design constraints and module map.
 
 #![forbid(unsafe_code)]
-
-mod accounts;
-mod admin;
-mod api;
-mod auth;
-mod blobs;
-mod delivery;
-mod halls;
-mod ingress;
-mod mls_ds;
-mod moderation;
-mod policy;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use accounts::store::InMemoryAccountStore;
-use api::{AppState, NullCaptchaVerifier, RegistrationConfig};
+use cue_node::accounts::store::InMemoryAccountStore;
+use cue_node::api::{self, AppState, NullCaptchaVerifier, RegistrationConfig};
+use cue_node::delivery::mailbox::InMemoryMailboxStore;
 
 #[tokio::main]
 async fn main() {
@@ -34,8 +19,26 @@ async fn main() {
     let state = Arc::new(AppState::new(
         Box::new(InMemoryAccountStore::new()),
         Box::new(NullCaptchaVerifier),
+        Box::new(InMemoryMailboxStore::new()),
         RegistrationConfig::default(),
     ));
+
+    // Undelivered envelopes get a hard 30-day TTL, not indefinite storage
+    // (docs/09 "deliver and delete") — this is what enforces that in the
+    // absence of a database TTL/cron job.
+    tokio::spawn({
+        let state = state.clone();
+        async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+            loop {
+                ticker.tick().await;
+                let dropped = state.sweep_expired_envelopes();
+                if dropped > 0 {
+                    tracing::debug!(dropped, "swept expired envelopes");
+                }
+            }
+        }
+    });
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8443")
         .await

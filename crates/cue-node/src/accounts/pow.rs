@@ -122,13 +122,13 @@ impl PowChallengeStore {
     }
 }
 
-/// Search for a `nonce` meeting `challenge`'s difficulty target. This is the
-/// client's half of the puzzle — `cue-node` never calls it outside its own
-/// tests, since it's `cue-core`'s job once the client core exists (docs/11
-/// Phase 1). Kept here, test-only, as the reference implementation the
-/// Node's own tests solve against.
-#[cfg(test)]
-pub(crate) fn solve(argon2_params: &Params, challenge: &PowChallenge) -> u64 {
+/// Search for a `nonce` meeting `challenge`'s difficulty target — the
+/// client's half of the puzzle. `pub`, not test-only: `cue-core` doesn't
+/// have its own registration module yet (docs/11 Phase 1), so both
+/// `cue-node`'s own tests and `cue-testkit`'s two-clients-plus-Node
+/// integration test call this directly as the reference client-side
+/// implementation until that lands.
+pub fn solve(argon2_params: &Params, challenge: &PowChallenge) -> u64 {
     let mut nonce: u64 = 0;
     loop {
         let hash = argon2_hash(argon2_params, &challenge.seed, nonce);
