@@ -8,3 +8,16 @@ publish.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+rand = "0.9"
+# Not published to crates.io by design (Signal's own choice); pinned by tag
+# rather than a branch so upgrades are a deliberate, reviewed rev bump. See
+# docs/03 "Implementation" and deny.toml for the licence/source-allow entries
+# this requires. `mlkem1024` selects the standardised ML-KEM-1024 KEM
+# (docs/03's "Post-quantum KEM" choice) over libsignal's legacy draft-Kyber
+# default.
+libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.3", features = [
+    "mlkem1024",
+] }
+
+[dev-dependencies]
+tokio = { workspace = true }

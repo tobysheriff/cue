@@ -3,6 +3,13 @@
 
 [advisories]
 yanked = "deny"
+ignore = [
+    # proc-macro-error2, pulled in transitively by libsignal-protocol's
+    # ML-KEM implementation (libcrux-ml-kem -> hax-lib-macros), is flagged
+    # unmaintained, not vulnerable. No safe upgrade exists upstream; revisit
+    # when libsignal updates its libcrux dependency.
+    "RUSTSEC-2026-0173",
+]
 
 [licenses]
 version = 2
@@ -16,9 +23,14 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "CC0-1.0",
+    # hpke-rs / hpke-rs-crypto, pulled in transitively by libsignal-protocol.
+    "MPL-2.0",
     # Cue's own crates (ADR-0008): AGPL-3.0 server, GPL-3.0 client core.
     "AGPL-3.0-or-later",
     "GPL-3.0-or-later",
+    # libsignal-protocol and its internal crates (docs/03 "Implementation":
+    # wrap libsignal directly rather than reimplement X3DH/the ratchet).
+    "AGPL-3.0-only",
 ]
 
 [bans]
@@ -32,3 +44,10 @@ multiple-versions = "warn"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+allow-git = [
+    # libsignal-protocol (docs/03): not published to crates.io by design,
+    # pinned by tag in crates/cue-crypto/Cargo.toml.
+    "https://github.com/signalapp/libsignal",
+    # Transitive dep of libsignal-protocol's post-quantum ratchet.
+    "https://github.com/signalapp/SparsePostQuantumRatchet.git",
+]

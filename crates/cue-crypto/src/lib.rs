@@ -11,7 +11,7 @@
 #![forbid(unsafe_code)]
 
 /// PQXDH session establishment and Double Ratchet messaging for 1:1 chats
-/// (docs/03 "Direct messages"). Wraps `libsignal-protocol`; not yet wired.
+/// (docs/03 "Direct messages"). Wraps `libsignal-protocol`.
 pub mod sessions;
 
 /// MLS group sessions via `openmls` (docs/03 "Encrypted groups", ADR-0003).
@@ -36,4 +36,7 @@ pub mod franking;
 pub enum CryptoError {
     #[error("operation not yet implemented: {0}")]
     NotImplemented(&'static str),
+
+    #[error(transparent)]
+    Signal(#[from] libsignal_protocol::SignalProtocolError),
 }
