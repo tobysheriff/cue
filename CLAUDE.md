@@ -28,33 +28,120 @@ bottom. Anything not listed here is still a stub; check its module doc comment f
 must never do before touching it.
 
 - **`cue-crypto::sessions`** — real: PQXDH + Double Ratchet via `libsignal-protocol`.
-  `Identity`, `generate_prekeys`, `establish_session`, `encrypt_message`, `decrypt_message`
-  all work end-to-end (round-trip test in `sessions.rs` — Alice and Bob complete a
-  handshake and exchange messages). Storage is in-memory only
+  `Identity`, `generate_prekeys`, `establish_session`, `encrypt_message`, `decrypt_message`,
+  `save_generated_prekeys` (saves a device's own generated prekeys locally before the
+  public bundle is published — added so `cue-core` doesn't need its own direct
+  `libsignal-protocol` dependency just to call the same three store-trait methods),
+  `deserialize_ciphertext` (reconstructs a `CiphertextMessage` from wire bytes + declared
+  `CiphertextMessageType` — Whisper/PreKey only, the two variants a 1:1 session ever
+  produces), and `bundle_from_parts` (reconstructs a `PreKeyBundle` from a peer's raw
+  published key bytes — the receiving side of `generate_prekeys`, used once those bytes
+  have crossed the wire) all work end-to-end (round-trip test in `sessions.rs` — Alice and
+  Bob complete a handshake and exchange messages; also exercised for real by
+  `cue-testkit`'s two-clients-plus-Node test). Storage is in-memory only
   (`libsignal_protocol::InMemSignalProtocolStore`); persistence is `cue-core`'s job
   (docs/06) and isn't wired yet.
 - **`cue-crypto::groups`, `::credentials`, `::franking`** — stubs (`NotImplemented`).
-- **`cue-proto`** — real: `Envelope`/`SizeBucket` wire types, plus a `registration.proto`
-  (`RegistrationChallenge`, `RegisterRequest`/`Response`, `PrekeyBundleResponse`,
-  `RerollHandleRequest`/`Response`) for `cue-node`'s registration API. Round-trip tested.
-- **`cue-node`** — real (Phase 1 registration slice): an axum server (`main.rs`) exposing
-  `POST /v1/register/challenge`, `POST /v1/register`, `POST /v1/register/reroll`, and
-  `GET /v1/accounts/{handle}/prekey-bundle`. `accounts::pow` (Argon2id proof of work,
-  single-use challenges), `accounts::handle` (adjective-nounNNN assignment from an embedded
-  128-word placeholder wordlist pair — docs/02 specs a curated 2,048-entry pair, swappable
-  later as a data change), `accounts::trust` (L0–L3 enum, always L0 today — the ramp logic
-  isn't implemented), and `accounts::store` (`AccountStore` trait + in-memory impl) all work
-  end-to-end, covered by an axum-`Router`-level integration test (`api::tests`, driven via
+- **`cue-proto`** — real: `Envelope`/`SizeBucket` wire types (`Envelope` now carries an
+  `envelope_id`, assigned by `delivery` on enqueue for dedup/ack — never set by the sender),
+  a `registration.proto` (`RegistrationChallenge`, `RegisterRequest`/`Response` — both now
+  carrying `registration_id`, required to reconstruct a usable `PreKeyBundle` and
+  previously missing from the wire format entirely,
+  `PrekeyBundleResponse` — also carrying the recipient's `mailbox_id` so a peer
+  establishing a session learns where to address envelopes, `RerollHandleRequest`/
+  `Response`) for `cue-node`'s registration API, a `delivery.proto`
+  (`MailboxEnvelopes`, `AckRequest`) for the mailbox API, and a `transport.proto`
+  (`SealedSenderStub`, `CiphertextMessageType`) — `cue-core`'s Phase 1 interim inner-envelope
+  format, carried inside `Envelope.ciphertext`; see the `cue-core` entry below for the
+  metadata-resistance trade-off it makes. Round-trip tested.
+- **`cue-node`** — real (Phase 1 registration + delivery slice): split into a library
+  (`lib.rs`, with `api` and `delivery` — and `accounts` for the integration test below —
+  `pub`) and a thin `main.rs` binary, so `cue-testkit`'s integration test can drive a real
+  `api::router` over a real socket from outside the crate; `accounts::pow::solve` (the
+  client-side PoW search) is likewise `pub`, not test-only, since no client has its own
+  registration module yet. An axum server exposing `POST /v1/register/challenge`,
+  `POST /v1/register`, `POST /v1/register/reroll`,
+  `GET /v1/accounts/{handle}/prekey-bundle`, `POST /v1/deliver`, `GET /v1/mailbox/{id}`,
+  `POST /v1/mailbox/{id}/ack`, and `GET /v1/mailbox/{id}/ws`. `accounts::pow` (Argon2id
+  proof of work, single-use challenges), `accounts::handle` (adjective-nounNNN assignment
+  from an embedded 128-word placeholder wordlist pair — docs/02 specs a curated
+  2,048-entry pair, swappable later as a data change), `accounts::trust` (L0–L3 enum,
+  always L0 today — the ramp logic isn't implemented), and `accounts::store`
+  (`AccountStore` trait + in-memory impl) all work end-to-end, covered by an
+  axum-`Router`-level integration test (`api::tests`, driven via
   `tower::ServiceExt::oneshot`) that registers an account, fetches and exhausts its
   one-time prekey, and reroll-authenticates with a real libsignal identity-key signature.
-  `ingress::reputation` provides IP-bucketing (daily-rotating HMAC, never stores or forwards
-  the IP itself) and strike-based CAPTCHA/review escalation; CAPTCHA verification itself is
-  a `CaptchaVerifier` trait with only a test stub (`NullCaptchaVerifier`) — no real provider
-  wired in. Storage is in-memory only; a Postgres-backed `AccountStore` is the natural next
-  step. `admin`, `auth`, `blobs`, `delivery`, `halls`, `mls_ds`, `moderation`, `policy` are
-  still stubs.
-- **`cue-kt`, `cue-core`, `cue-testkit`** — stubs / scaffolding only. `cue-core`'s
-  `Command`/`Event` enums are intentionally empty.
+  `delivery::mailbox` (`MailboxStore` trait + in-memory impl) is a deliver-and-delete queue
+  keyed by opaque `mailbox_id` alone — no dependency on `accounts`, by design (docs/04 #2,
+  #3) — with a hard 30-day TTL swept hourly from `main`, `POST /v1/deliver` validating
+  ciphertext length against its claimed `SizeBucket`, and `GET /v1/mailbox/{id}/ws` flushing
+  the queue on connect then fanning out live enqueues, tested end-to-end with a real bound
+  socket and `tokio-tungstenite` as the client. Known Phase 1 gap against docs/04: mailbox
+  IDs are minted once at registration and never epoch-rotate (Phase 3's job), and there's no
+  sealed-sender/anonymous-credential auth on the delivery endpoints yet (also Phase 3) — the
+  Node currently trusts whatever `mailbox_id` a caller supplies, same trust level as
+  registration's PoW-gated-but-otherwise-open endpoints. `ingress::reputation` provides
+  IP-bucketing (daily-rotating HMAC, never stores or forwards the IP itself) and
+  strike-based CAPTCHA/review escalation; CAPTCHA verification itself is a `CaptchaVerifier`
+  trait with only a test stub (`NullCaptchaVerifier`) — no real provider wired in. Storage
+  is in-memory only throughout; a Postgres-backed `AccountStore` and `envelopes` table are
+  the natural next step. `admin`, `auth`, `blobs`, `halls`, `mls_ds`, `moderation`, `policy`
+  are still stubs.
+- **`cue-core`** — real (Phase 1 session slice): `Command`/`Event` are no longer empty —
+  `Command::{EstablishSession, SendMessage, ReceiveMessage}` in, `Event::{SessionEstablished,
+  MessageSent, MessageReceived, CommandFailed}` out, both with hand-written (not derived)
+  `Debug` impls that print shapes/lengths only, never plaintext or key material. `session::
+  SessionManager` wraps `cue_crypto::sessions` (one `InMemSignalProtocolStore` per device,
+  in-memory only — same caveat as `cue-crypto::sessions` itself, persistence still
+  unwired). `Core::spawn` runs the actor on its own dedicated OS thread with a
+  single-threaded Tokio runtime + `LocalSet`, not `tokio::spawn` on a shared runtime —
+  `libsignal-protocol`'s store traits return `!Send` futures, so a plain `tokio::spawn`
+  doesn't compile; this is still "its own Tokio runtime" per docs/06, just not the shell's.
+  Tested at both layers: `session::tests` exercises `SessionManager` directly (mirroring
+  `cue-crypto`'s own round-trip test), and `tests` in `lib.rs` drives two full `Core` actors
+  purely through their `Command`/`Event` channels to complete a handshake and exchange
+  messages both directions.
+
+  `transport` (new) resolves `Event::MessageSent`'s former "still undesigned" gap:
+  `seal_for_delivery`/`open_received` turn a raw `CiphertextMessage` into a wire-ready
+  `cue_proto::v1::Envelope` and back, and `NodeClient` (`reqwest`, rustls) speaks
+  `cue-node`'s full delivery surface — `/v1/deliver`, `/v1/mailbox/{id}`,
+  `/v1/mailbox/{id}/ack`, `/v1/accounts/{handle}/prekey-bundle` over HTTP, plus
+  `watch_mailbox` opening a live `GET /v1/mailbox/{id}/ws` connection
+  (`tokio-tungstenite`) that returns a `MailboxStream` with `recv`/`ack`, so a shell isn't
+  limited to polling `fetch_mailbox`. It is a separate layer composed with `Core` over its
+  public channels, not a new `Command`/`Event` variant. **Deliberate,
+  tracked trade-off:** sender identity travels in the clear inside
+  `Envelope.ciphertext` (a `cue_proto::v1::SealedSenderStub`, not a new `Envelope` field),
+  because real sealed sender — asymmetric encryption of sender identity to the recipient's
+  identity key (docs/03) — is Phase 3 crypto work, not wiring; libsignal's decrypt is
+  keyed by sender address, so the recipient needs to learn it somehow before Phase 3 lands.
+  This is a real metadata-resistance regression against docs/04 #2, accepted for Phase 1
+  only and documented on `SealedSenderStub` itself. Padding reaches bucket granularity only
+  (the four docs/04 sizes), not a stronger traffic-analysis bar — that's the Phase 3
+  harness's job. Also assumes one (primary) device per account, matching `cue-node`'s
+  current account model.
+
+  Exercised end-to-end (not just unit-tested) by `cue-testkit`'s
+  `two_clients_and_a_node.rs`, two tests: the polling path (two real
+  `Core`+`SessionManager` clients, real HTTP registration including solving a real PoW
+  challenge, and a real bound `cue-node` socket — the closest thing to Phase 1's "two
+  people message each other" exit criterion that exists yet, and the
+  "two-clients-plus-Node integration test in CI" docs/11 asks for), and the live
+  `watch_mailbox` path (connects before delivery, so a passing `recv()` proves the
+  server's live fan-out branch, not its connect-time queue flush; acks over the socket
+  itself rather than the HTTP endpoint).
+
+  Not yet built: the encrypted local store (docs/06 "Local storage"), KT verification, and
+  group sessions/MLS.
+- **`cue-kt`** — stub / scaffolding only.
+- **`cue-testkit`** — `size_bucket_for` is real (the docs/04 1/4/16/64 KB mapping — an
+  independent reference implementation, not one `cue-core`'s `transport` calls into, so it
+  can actually catch drift). `tests/two_clients_and_a_node.rs` (two tests, polling and live
+  WebSocket push) is the docs/11 Phase 1 exit test described above; it's why this crate
+  carries dev-dependencies on `cue-core`, `cue-crypto`, and `cue-node` even though its own
+  runtime `lib.rs` still depends on `cue-proto` only, matching the architecture diagram
+  below. The traffic-analysis harness itself is still Phase 3 scope.
 
 ## Commands
 
@@ -134,7 +221,12 @@ cue-core  (client core, GPL-3.0)          cue-node  (server, AGPL-3.0)
   person) is likewise load-bearing, not aspirational.
 - **`cue-testkit`** — protocol conformance suite (any future client must pass it) plus the
   traffic-analysis harness that asserts envelope sizes are uniform within a bucket and
-  Quiet Mode timing is indistinguishable from idle (Phase 3+, then runs in CI forever).
+  Quiet Mode timing is indistinguishable from idle (Phase 3+, then runs in CI forever). Its
+  runtime `lib.rs` depends on `cue-proto` only, matching the diagram above — but it carries
+  `cue-core`/`cue-crypto`/`cue-node` as **dev-dependencies** for its cross-crate integration
+  tests (e.g. `tests/two_clients_and_a_node.rs`), which is this crate's actual job: it's
+  the one place allowed to depend on a real client and a real server at once to verify they
+  agree on the wire.
 
 Clients (`clients/desktop`, `clients/web`) are not started yet — see their READMEs and
 `docs/06-client-architecture.md`.
@@ -169,7 +261,7 @@ behavior, rather than re-deriving the reasoning from scratch.
 
 ## Keeping this file current
 
-Update this file before ending any coding session that changed what's implemented, not
+Along with committing all changes and writing descriptive commit messages for each file, update this file before ending any coding session that changed what's implemented, not
 just what's documented — a stale status here is worse than none, since the next session
 (or the next instance of Claude) will trust it over re-deriving state from scratch:
 
