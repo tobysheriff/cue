@@ -22,13 +22,17 @@
 
 use std::time::SystemTime;
 
-use libsignal_protocol::kem;
+pub use libsignal_protocol::kem;
 pub use libsignal_protocol::{
-    CiphertextMessage, DeviceId, IdentityKeyPair, InMemSignalProtocolStore, KyberPreKeyId,
-    KyberPreKeyRecord, PreKeyBundle, PreKeyId, PreKeyRecord, ProtocolAddress, PublicKey,
-    SignedPreKeyId, SignedPreKeyRecord, Timestamp,
+    CiphertextMessage, CiphertextMessageType, DeviceId, IdentityKey, IdentityKeyPair,
+    InMemSignalProtocolStore, KyberPreKeyId, KyberPreKeyRecord, PreKeyBundle, PreKeyId,
+    PreKeyRecord, PreKeySignalMessage, ProtocolAddress, PublicKey, SignalMessage, SignedPreKeyId,
+    SignedPreKeyRecord, Timestamp,
 };
-use libsignal_protocol::{GenericSignedPreKey as _, KeyPair};
+use libsignal_protocol::{
+    GenericSignedPreKey as _, KeyPair, KyberPreKeyStore as _, PreKeyStore as _,
+    SignedPreKeyStore as _,
+};
 use rand::{CryptoRng, Rng};
 
 use crate::CryptoError;
@@ -159,6 +163,30 @@ pub fn generate_prekeys<R: Rng + CryptoRng>(
     })
 }
 
+/// Save `prekeys` into `store` so this device can complete an inbound
+/// PQXDH handshake that references them (docs/02 "Registration flow": the
+/// private halves must be saved locally *before* the public `bundle` is
+/// published — publishing first would let a peer's handshake reference
+/// prekeys this device can't yet answer with).
+pub async fn save_generated_prekeys(
+    store: &mut InMemSignalProtocolStore,
+    prekeys: &GeneratedPrekeys,
+) -> Result<(), CryptoError> {
+    store
+        .pre_key_store
+        .save_pre_key(prekeys.one_time_prekey.0, &prekeys.one_time_prekey.1)
+        .await?;
+    store
+        .signed_pre_key_store
+        .save_signed_pre_key(prekeys.signed_prekey.0, &prekeys.signed_prekey.1)
+        .await?;
+    store
+        .kyber_pre_key_store
+        .save_kyber_pre_key(prekeys.kyber_prekey.0, &prekeys.kyber_prekey.1)
+        .await?;
+    Ok(())
+}
+
 /// Establish an outbound session from a recipient's published prekey bundle
 /// (docs/03 "Session establishment: PQXDH"): an X25519 DH combination *and*
 /// an ML-KEM-1024 encapsulation, both mixed into the root key for
@@ -234,10 +262,96 @@ pub async fn decrypt_message<R: Rng + CryptoRng>(
     Ok(plaintext)
 }
 
+/// One raw signed prekey (EC or Kyber) as served by a Node's
+/// `prekey-bundle` endpoint, before its bytes have been validated into a
+/// [`PublicKey`]/[`kem::PublicKey`] (docs/03).
+pub struct RawSignedPrekey {
+    pub id: u32,
+    pub public_key: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
+pub struct RawOneTimePrekey {
+    pub id: u32,
+    pub public_key: Vec<u8>,
+}
+
+/// Reconstruct a [`PreKeyBundle`] from a peer's published wire-format key
+/// material (docs/03 "Session establishment: PQXDH") — the receiving side
+/// of what [`generate_prekeys`]'s `bundle` field produces for a Node to
+/// serve back out. `one_time_prekey` is `None` exactly when the Node's
+/// buffer was already empty (docs/02).
+///
+/// Takes raw parts rather than a `cue_proto` wire type: this crate never
+/// depends on `cue-proto` (docs/03's charter — a policy wrapper over
+/// primitives, nothing more), so unpacking the wire response is
+/// `cue-core`'s `transport` module's job; this is the validation step once
+/// the bytes are in hand.
+#[allow(clippy::too_many_arguments)]
+pub fn bundle_from_parts(
+    registration_id: u32,
+    device_id: DeviceId,
+    identity_key: &[u8],
+    signed_prekey: RawSignedPrekey,
+    kyber_prekey: RawSignedPrekey,
+    one_time_prekey: Option<RawOneTimePrekey>,
+) -> Result<PreKeyBundle, CryptoError> {
+    let identity_key = IdentityKey::decode(identity_key)?;
+    let signed_pre_key_public = PublicKey::deserialize(&signed_prekey.public_key)
+        .map_err(libsignal_protocol::SignalProtocolError::from)?;
+    let kyber_pre_key_public = kem::PublicKey::deserialize(&kyber_prekey.public_key)?;
+    let one_time = one_time_prekey
+        .map(|p| -> Result<_, CryptoError> {
+            let public_key = PublicKey::deserialize(&p.public_key)
+                .map_err(libsignal_protocol::SignalProtocolError::from)?;
+            Ok((PreKeyId::from(p.id), public_key))
+        })
+        .transpose()?;
+
+    Ok(PreKeyBundle::new(
+        registration_id,
+        device_id,
+        one_time,
+        SignedPreKeyId::from(signed_prekey.id),
+        signed_pre_key_public,
+        signed_prekey.signature,
+        KyberPreKeyId::from(kyber_prekey.id),
+        kyber_pre_key_public,
+        kyber_prekey.signature,
+        identity_key,
+    )?)
+}
+
+/// Reconstruct a [`CiphertextMessage`] from its wire bytes and declared
+/// [`CiphertextMessageType`] (docs/03) — the receiving side of what
+/// [`CiphertextMessage::serialize`] and [`CiphertextMessage::message_type`]
+/// produce, needed once a message has crossed the wire and lost its enum
+/// shape. Only `Whisper` and `PreKey` are handled: those are the two
+/// variants [`encrypt_message`] can ever produce for a 1:1 session —
+/// `SenderKey`/`Plaintext` are MLS/group concerns this module doesn't
+/// touch (docs/03 "Encrypted groups" lands in `groups`, separately).
+pub fn deserialize_ciphertext(
+    message_type: CiphertextMessageType,
+    bytes: &[u8],
+) -> Result<CiphertextMessage, CryptoError> {
+    match message_type {
+        CiphertextMessageType::Whisper => Ok(CiphertextMessage::SignalMessage(
+            SignalMessage::try_from(bytes)?,
+        )),
+        CiphertextMessageType::PreKey => Ok(CiphertextMessage::PreKeySignalMessage(
+            PreKeySignalMessage::try_from(bytes)?,
+        )),
+        CiphertextMessageType::SenderKey | CiphertextMessageType::Plaintext => {
+            Err(CryptoError::NotImplemented(
+                "deserialize_ciphertext only handles 1:1 session message types (Whisper, PreKey)",
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libsignal_protocol::{KyberPreKeyStore as _, PreKeyStore as _, SignedPreKeyStore as _};
     use rand::rngs::OsRng;
     use rand::TryRngCore as _;
 
@@ -263,24 +377,9 @@ mod tests {
             &mut csprng,
         )
         .unwrap();
-        bob_store
-            .pre_key_store
-            .save_pre_key(
-                bob_prekeys.one_time_prekey.0,
-                &bob_prekeys.one_time_prekey.1,
-            )
+        save_generated_prekeys(&mut bob_store, &bob_prekeys)
             .await
-            .unwrap();
-        bob_store
-            .signed_pre_key_store
-            .save_signed_pre_key(bob_prekeys.signed_prekey.0, &bob_prekeys.signed_prekey.1)
-            .await
-            .unwrap();
-        bob_store
-            .kyber_pre_key_store
-            .save_kyber_pre_key(bob_prekeys.kyber_prekey.0, &bob_prekeys.kyber_prekey.1)
-            .await
-            .unwrap();
+            .expect("Bob can save his own generated prekeys before publishing them");
 
         establish_session(
             &mut alice_store,
