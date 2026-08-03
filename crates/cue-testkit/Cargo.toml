@@ -1,0 +1,10 @@
+[package]
+name = "cue-testkit"
+description = "Protocol conformance suite and traffic-analysis harness (docs/06, docs/04 'Verification'). Any future client implementation must pass this suite."
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+cue-proto = { path = "../cue-proto" }

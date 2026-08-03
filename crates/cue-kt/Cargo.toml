@@ -1,0 +1,10 @@
+[package]
+name = "cue-kt"
+description = "Key transparency: Merkle prefix tree, signed tree heads, inclusion/consistency proofs, auditor API (docs/03 'Key transparency')."
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }

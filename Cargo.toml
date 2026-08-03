@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cue-proto",
+    "crates/cue-crypto",
+    "crates/cue-kt",
+    "crates/cue-node",
+    "crates/cue-core",
+    "crates/cue-testkit",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/cue-im/cue"
+publish = false
+
+[workspace.dependencies]
+prost = "0.13"
+prost-types = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+thiserror = "2"
+tracing = "0.1"
+
+[profile.release]
+# Reproducible builds (docs/11 Phase 0): deterministic codegen units, no
+# debug-info path leakage from the build environment.
+codegen-units = 1
+debug = false
+strip = true

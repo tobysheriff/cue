@@ -1,0 +1,28 @@
+/target
+**/target
+# Cargo.lock is committed: cue-node is a binary, and reproducible builds
+# depend on a pinned dependency graph (docs/11 Phase 0).
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+
+# Node / Electron / web clients
+node_modules/
+dist/
+dist-electron/
+.env
+.env.*
+!.env.example
+
+# Local config / secrets
+*.pem
+*.key
+config.local.toml
+
+# Claude Code local (non-shared) session state
+.claude/

@@ -1,0 +1,34 @@
+# cargo-deny config (docs/11 Phase 0: "deny.toml for licences/advisories").
+# Run with `cargo deny check`.
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    # Cue's own crates (ADR-0008): AGPL-3.0 server, GPL-3.0 client core.
+    "AGPL-3.0-or-later",
+    "GPL-3.0-or-later",
+]
+
+[bans]
+wildcards = "deny"
+# Our own crates are workspace path dependencies with no version (publish =
+# false, see root Cargo.toml) — that's a wildcard by cargo-deny's definition
+# but not the unpinned-external-dependency risk this lint exists to catch.
+allow-wildcard-paths = true
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

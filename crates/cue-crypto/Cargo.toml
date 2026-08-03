@@ -1,0 +1,10 @@
+[package]
+name = "cue-crypto"
+description = "Policy wrapper over the cryptographic primitives (docs/03): PQXDH, Double Ratchet, MLS, zkgroup-style credentials, key transparency proofs."
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }

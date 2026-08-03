@@ -1,0 +1,19 @@
+[package]
+name = "cue-node"
+description = "The Cue Node: one binary, one Postgres database, one object store (docs/05)."
+license = "AGPL-3.0-or-later"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "cue-node"
+path = "src/main.rs"
+
+[dependencies]
+cue-proto = { path = "../cue-proto" }
+cue-crypto = { path = "../cue-crypto" }
+cue-kt = { path = "../cue-kt" }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

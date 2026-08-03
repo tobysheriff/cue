@@ -1,0 +1,16 @@
+[package]
+name = "cue-proto"
+description = "Cue wire format: protobuf schema and generated types, shared by cue-node, cue-core, and every client."
+# Generated types are Apache-2.0 per ADR-0008, distinct from the workspace default.
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+prost = { workspace = true }
+prost-types = { workspace = true }
+
+[build-dependencies]
+prost-build = "0.13"
+protox = "0.7"

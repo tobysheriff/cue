@@ -1,0 +1,20 @@
+Cue is not a single-licence project. Different components carry different
+licences, deliberately (see docs/adr/0008-licensing.md for the reasoning):
+
+  crates/cue-node/            AGPL-3.0-or-later   ./LICENSE-AGPL-3.0
+  crates/cue-core/            GPL-3.0-or-later    ./LICENSE-GPL-3.0
+  clients/                    GPL-3.0-or-later    ./LICENSE-GPL-3.0
+  crates/cue-proto/           Apache-2.0          ./crates/cue-proto/LICENSE-APACHE
+  Protocol specification      CC-BY-4.0           ./docs/LICENSE-CC-BY-4.0
+  crates/cue-crypto/          AGPL-3.0-or-later   ./LICENSE-AGPL-3.0
+  crates/cue-kt/              AGPL-3.0-or-later   ./LICENSE-AGPL-3.0
+  crates/cue-testkit/         AGPL-3.0-or-later   ./LICENSE-AGPL-3.0
+
+Every crate also declares its licence in its own Cargo.toml `license` field,
+which is the authoritative source if this file and the manifests ever
+disagree.
+
+Contributions are accepted under a Developer Certificate of Origin
+(`Signed-off-by`), not a CLA. There is no copyright assignment: this project
+cannot be relicensed without contacting every contributor, which is
+intentional (ADR-0008).

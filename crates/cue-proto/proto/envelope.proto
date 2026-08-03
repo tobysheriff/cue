@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+package cue.v1;
+
+// The fixed-size buckets every envelope is padded to before encryption
+// (docs/04-metadata-resistance.md). An observer sees only the bucket, never
+// the exact plaintext length. Anything larger becomes an attachment,
+// fetched over a separate, decorrelated path.
+enum SizeBucket {
+  SIZE_BUCKET_UNSPECIFIED = 0;
+  SIZE_BUCKET_B1KB = 1;
+  SIZE_BUCKET_B4KB = 2;
+  SIZE_BUCKET_B16KB = 3;
+  SIZE_BUCKET_B64KB = 4;
+}
+
+// The only object the Node's application layer ever sees on the delivery
+// path. Everything that would identify sender or content lives inside
+// `ciphertext` (sealed sender, docs/04 #2) — the Node routes on `mailbox_id`
+// alone and never learns who sent an envelope or what it contains.
+//
+// This message must never grow a plaintext field for sender identity,
+// recipient identity beyond the opaque mailbox, or content length outside
+// `size_bucket`. Any change here is a metadata-resistance regression.
+message Envelope {
+  // Wire format version. Not a feature-negotiation field: a version bump
+  // means the padding/framing rules changed, and old and new versions must
+  // be rejected rather than silently reinterpreted.
+  uint32 version = 1;
+
+  // Opaque, epoch-rotating mailbox identifier (docs/04 #3). Never a stable
+  // per-device or per-account identifier.
+  bytes mailbox_id = 2;
+
+  SizeBucket size_bucket = 3;
+
+  // AEAD ciphertext, padded to exactly `size_bucket` bytes before
+  // encryption. Contains the sealed sender and the padded plaintext payload.
+  bytes ciphertext = 4;
+}
