@@ -5,6 +5,8 @@ fn main() {
     let protos = [
         proto_dir.join("envelope.proto"),
         proto_dir.join("registration.proto"),
+        proto_dir.join("delivery.proto"),
+        proto_dir.join("transport.proto"),
     ];
 
     // protox is a pure-Rust protobuf parser: no system `protoc` install

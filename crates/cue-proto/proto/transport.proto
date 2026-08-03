@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package cue.v1;
+
+// Phase 1's interim inner-envelope, carried inside `Envelope.ciphertext`
+// (docs/06 "transport... still undesigned" gap, now resolved for Phase 1).
+// Wrapping it inside `ciphertext` rather than adding fields to `Envelope`
+// itself keeps that message's own schema — and its "must never carry a
+// plaintext sender identity" invariant — untouched.
+//
+// This message itself is the deliberate, tracked exception: `sender_handle`
+// and `sender_device_id` are plaintext, not encrypted to the recipient, so
+// the Node's operator can read them off `ciphertext` today. That is a real
+// metadata-resistance gap against docs/04 #2, accepted for Phase 1 only.
+// Real sealed sender — asymmetric encryption of sender identity to the
+// recipient's identity key (docs/03 "Sealed sender") — is Phase 3 scope.
+// When it lands, delete this message and the plaintext-sender path in
+// `cue-core`'s `transport` module; don't extend this one to bolt encryption
+// onto it in place.
+message SealedSenderStub {
+  string sender_handle = 1;
+  uint32 sender_device_id = 2;
+  CiphertextMessageType message_type = 3;
+  // Serialized `libsignal_protocol::CiphertextMessage` bytes — the real
+  // PQXDH/Double Ratchet output (docs/03). Opaque to the Node either way.
+  bytes message = 4;
+}
+
+// Mirrors the two `libsignal_protocol::CiphertextMessageType` variants a
+// 1:1 session ever produces. `SenderKey`/`Plaintext` are MLS/group-messaging
+// concerns `cue-core`'s session transport doesn't touch.
+enum CiphertextMessageType {
+  CIPHERTEXT_MESSAGE_TYPE_UNSPECIFIED = 0;
+  CIPHERTEXT_MESSAGE_TYPE_PREKEY = 1;
+  CIPHERTEXT_MESSAGE_TYPE_WHISPER = 2;
+}

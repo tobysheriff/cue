@@ -49,6 +49,11 @@ message RegisterRequest {
   SignedPrekey signed_prekey = 5;
   SignedPrekey kyber_prekey = 6;
   repeated OneTimePrekey one_time_prekeys = 7;
+  // libsignal's own registration id (docs/03 "Session establishment:
+  // PQXDH"): distinguishes a reinstalled client from the account itself.
+  // Required by `PreKeyBundle` on the receiving side of a handshake — not
+  // optional wire ornamentation.
+  uint32 registration_id = 8;
 }
 
 // The public half of a device's key material, as served to a peer that
@@ -61,6 +66,16 @@ message PrekeyBundleResponse {
   SignedPrekey signed_prekey = 2;
   SignedPrekey kyber_prekey = 3;
   OneTimePrekey one_time_prekey = 4;
+  // The recipient device's current opaque mailbox identifier (docs/04 #3),
+  // so a peer establishing a session also learns where to address
+  // envelopes. Phase 1 mints this once at registration and never rotates
+  // it; daily epoch rotation is Phase 3's job (`delivery`'s doc comment) —
+  // until then this value is stable, which is a known, tracked gap against
+  // docs/04, not the final design.
+  bytes mailbox_id = 5;
+  // See `RegisterRequest.registration_id` — required to reconstruct a
+  // usable `PreKeyBundle` from this response.
+  uint32 registration_id = 6;
 }
 
 message RegisterResponse {

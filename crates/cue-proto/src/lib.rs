@@ -26,6 +26,7 @@ mod tests {
             mailbox_id: vec![0xAB; 16],
             size_bucket: SizeBucket::B1kb as i32, // proto: SIZE_BUCKET_B1KB
             ciphertext: vec![0; 1024],
+            envelope_id: vec![0xCD; 16],
         };
 
         let bytes = envelope.encode_to_vec();

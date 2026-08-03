@@ -37,4 +37,11 @@ message Envelope {
   // AEAD ciphertext, padded to exactly `size_bucket` bytes before
   // encryption. Contains the sealed sender and the padded plaintext payload.
   bytes ciphertext = 4;
+
+  // Delivery's dedup/ack handle (docs/09 "client-side dedup by envelope
+  // ID"). Assigned by the Node's `delivery` module when an envelope is
+  // enqueued — never set by the sender, never derived from sender or
+  // recipient identity, and meaningless outside the mailbox it was issued
+  // for. `POST /v1/deliver` ignores this field on the way in.
+  bytes envelope_id = 5;
 }

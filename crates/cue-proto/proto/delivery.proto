@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package cue.v1;
+
+import "envelope.proto";
+
+// The Node's answer to a mailbox fetch: whatever `Envelope`s are currently
+// queued and undelivered (docs/09 "deliver and delete"). Fetching does not
+// delete anything — only `AckRequest` does — so a client can poll or
+// reconnect without losing envelopes it hasn't yet processed.
+message MailboxEnvelopes {
+  repeated Envelope envelopes = 1;
+}
+
+// Acknowledge one or more delivered envelopes for permanent deletion
+// (docs/09: "an envelope exists only until every recipient device
+// acknowledges it"). There is no partial-failure response: an unknown or
+// already-deleted `envelope_id` is silently a no-op, since the outcome
+// either way is "this envelope_id is gone from the mailbox."
+message AckRequest {
+  repeated bytes envelope_ids = 1;
+}
