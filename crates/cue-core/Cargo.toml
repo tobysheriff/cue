@@ -10,5 +10,16 @@ publish.workspace = true
 cue-proto = { path = "../cue-proto" }
 cue-crypto = { path = "../cue-crypto" }
 cue-kt = { path = "../cue-kt" }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
 thiserror = { workspace = true }
+rand = "0.9"
+prost = { workspace = true }
+# Onion transport (Tor via `arti`, docs/06) lands later; a plain HTTPS
+# client is Phase 1's "ugly but real" bar. rustls, not the system TLS
+# stack, to keep the dependency set boring and auditable (docs/05).
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+# The live half of mailbox delivery (`GET /v1/mailbox/{id}/ws`); `NodeClient::deliver`/
+# `fetch_mailbox` cover the polling half. Plain `ws://` only for now, matching
+# `reqwest` above — no TLS feature enabled here yet.
+tokio-tungstenite = "0.29"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

@@ -25,6 +25,10 @@ allow = [
     "CC0-1.0",
     # hpke-rs / hpke-rs-crypto, pulled in transitively by libsignal-protocol.
     "MPL-2.0",
+    # webpki-root-certs (Mozilla's root CA bundle as data, not code),
+    # pulled in transitively by reqwest's rustls TLS backend (cue-core's
+    # transport module, docs/06 "Transport").
+    "CDLA-Permissive-2.0",
     # Cue's own crates (ADR-0008): AGPL-3.0 server, GPL-3.0 client core.
     "AGPL-3.0-or-later",
     "GPL-3.0-or-later",
