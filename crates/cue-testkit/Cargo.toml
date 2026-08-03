@@ -8,3 +8,19 @@ publish.workspace = true
 
 [dependencies]
 cue-proto = { path = "../cue-proto" }
+
+[dev-dependencies]
+# Dev-only: the two-clients-plus-Node integration test (docs/11 Phase 1
+# exit criterion) needs a real client (cue-core) and a real server
+# (cue-node) to drive against each other. This crate's own runtime lib
+# above depends on cue-proto only, matching the architecture diagram — the
+# extra deps here never reach anything that depends on cue-testkit's lib.
+cue-core = { path = "../cue-core" }
+cue-crypto = { path = "../cue-crypto" }
+cue-node = { path = "../cue-node" }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros"] }
+rand = "0.9"
+prost = { workspace = true }
+argon2 = "0.5.3"
+axum = { version = "0.8.9", features = ["ws"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }

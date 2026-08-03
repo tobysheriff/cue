@@ -12,8 +12,23 @@
 
 #![forbid(unsafe_code)]
 
-pub fn size_bucket_for(_ciphertext_len: usize) -> cue_proto::v1::SizeBucket {
-    // TODO(Phase 0/1): implement the actual 1/4/16/64 KB bucket mapping
-    // from docs/04 once cue-core has real envelopes to pad.
-    cue_proto::v1::SizeBucket::Unspecified
+/// The 1/4/16/64 KB bucket mapping from docs/04 "fixed-size padded
+/// envelopes": the smallest bucket `ciphertext_len` fits inside, or
+/// `Unspecified` if it exceeds even the largest bucket — that case must
+/// become an attachment on a separate, decorrelated fetch path (docs/04),
+/// not a bigger envelope.
+///
+/// This is an independent reference implementation, not one `cue-core`
+/// calls into: the point of a conformance suite is to catch a real
+/// implementation's bucket selection drifting from the spec, which a
+/// shared helper both sides call could never do.
+pub fn size_bucket_for(ciphertext_len: usize) -> cue_proto::v1::SizeBucket {
+    use cue_proto::v1::SizeBucket;
+    match ciphertext_len {
+        0..=1024 => SizeBucket::B1kb,
+        1025..=4096 => SizeBucket::B4kb,
+        4097..=16384 => SizeBucket::B16kb,
+        16385..=65536 => SizeBucket::B64kb,
+        _ => SizeBucket::Unspecified,
+    }
 }
