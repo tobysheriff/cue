@@ -1,0 +1,87 @@
+syntax = "proto3";
+
+package cue.v1;
+
+// A single signed prekey (EC or Kyber) in publishable form: the id a
+// recipient's session-establishment references it by, the public key
+// itself, and `identity_key`'s signature over that public key (docs/02
+// "Cryptographic identity", docs/03 "Session establishment: PQXDH"). The
+// Node stores and serves these fields as opaque bytes — it never needs to
+// interpret the key material itself.
+message SignedPrekey {
+  uint32 id = 1;
+  bytes public_key = 2;
+  bytes signature = 3;
+}
+
+// A one-time EC prekey: unsigned, consumed on first use, replenished by the
+// owning device (docs/02).
+message OneTimePrekey {
+  uint32 id = 1;
+  bytes public_key = 2;
+}
+
+// Issued by `POST /v1/register/challenge` before any account exists, so it
+// carries no account or device identifier of any kind (docs/02
+// "Registration and anti-abuse"). `captcha_required` reflects the ingress
+// bucket's reputation at issuance time only — the Node forgets the bucket
+// key's link to any IP the moment this response is built (docs/04 #5).
+message RegistrationChallenge {
+  bytes challenge_id = 1;
+  bytes seed = 2;
+  // Target leading-zero-bit count over Argon2id(seed || pow_nonce)
+  // (docs/03 "Proof of work"). A server-side dial, not a client choice.
+  uint32 difficulty_bits = 3;
+  bool captcha_required = 4;
+}
+
+// The one-shot registration request: a solved challenge plus the first
+// device's publishable key material (docs/02 "Registration flow"). There is
+// deliberately no phone number, email, or password field here, and never
+// will be (ADR-0001).
+message RegisterRequest {
+  bytes challenge_id = 1;
+  uint64 pow_nonce = 2;
+  // Empty when the issuing challenge did not require one.
+  string captcha_token = 3;
+
+  bytes identity_key = 4;
+  SignedPrekey signed_prekey = 5;
+  SignedPrekey kyber_prekey = 6;
+  repeated OneTimePrekey one_time_prekeys = 7;
+}
+
+// The public half of a device's key material, as served to a peer that
+// wants to establish a PQXDH session with it (docs/03 "Session
+// establishment: PQXDH"). `one_time_prekey` is consumed (removed from the
+// Node's buffer) the moment it's served — docs/02: "consumed on session
+// setup" — so it is absent if the buffer was already empty.
+message PrekeyBundleResponse {
+  bytes identity_key = 1;
+  SignedPrekey signed_prekey = 2;
+  SignedPrekey kyber_prekey = 3;
+  OneTimePrekey one_time_prekey = 4;
+}
+
+message RegisterResponse {
+  bytes account_id = 1;
+  // "adjective-nounNNN" (docs/02 "Handles") — assigned, never chosen.
+  string handle = 2;
+  uint32 rerolls_remaining = 3;
+}
+
+// A rerolled handle costs one of the free rerolls tracked on the account
+// (docs/02: 3 free at signup, then 1/30 days); it never re-solves PoW or
+// touches prekeys. There is no password, so proof of ownership is a
+// signature over `account_id` from the primary device's identity key
+// (docs/02 "no password... the identity key is the credential") rather than
+// a bearer token.
+message RerollHandleRequest {
+  bytes account_id = 1;
+  bytes signature = 2;
+}
+
+message RerollHandleResponse {
+  string handle = 1;
+  uint32 rerolls_remaining = 2;
+}

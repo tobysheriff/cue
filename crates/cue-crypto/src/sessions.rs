@@ -25,8 +25,8 @@ use std::time::SystemTime;
 use libsignal_protocol::kem;
 pub use libsignal_protocol::{
     CiphertextMessage, DeviceId, IdentityKeyPair, InMemSignalProtocolStore, KyberPreKeyId,
-    KyberPreKeyRecord, PreKeyBundle, PreKeyId, PreKeyRecord, ProtocolAddress, SignedPreKeyId,
-    SignedPreKeyRecord, Timestamp,
+    KyberPreKeyRecord, PreKeyBundle, PreKeyId, PreKeyRecord, ProtocolAddress, PublicKey,
+    SignedPreKeyId, SignedPreKeyRecord, Timestamp,
 };
 use libsignal_protocol::{GenericSignedPreKey as _, KeyPair};
 use rand::{CryptoRng, Rng};

@@ -34,9 +34,27 @@ must never do before touching it.
   (`libsignal_protocol::InMemSignalProtocolStore`); persistence is `cue-core`'s job
   (docs/06) and isn't wired yet.
 - **`cue-crypto::groups`, `::credentials`, `::franking`** — stubs (`NotImplemented`).
-- **`cue-proto`** — real: `Envelope`/`SizeBucket` wire types, round-trip tested.
-- **`cue-kt`, `cue-core`, `cue-testkit`, `cue-node`** — stubs / scaffolding only. `cue-node`'s
-  `main.rs` is `todo!()`; `cue-core`'s `Command`/`Event` enums are intentionally empty.
+- **`cue-proto`** — real: `Envelope`/`SizeBucket` wire types, plus a `registration.proto`
+  (`RegistrationChallenge`, `RegisterRequest`/`Response`, `PrekeyBundleResponse`,
+  `RerollHandleRequest`/`Response`) for `cue-node`'s registration API. Round-trip tested.
+- **`cue-node`** — real (Phase 1 registration slice): an axum server (`main.rs`) exposing
+  `POST /v1/register/challenge`, `POST /v1/register`, `POST /v1/register/reroll`, and
+  `GET /v1/accounts/{handle}/prekey-bundle`. `accounts::pow` (Argon2id proof of work,
+  single-use challenges), `accounts::handle` (adjective-nounNNN assignment from an embedded
+  128-word placeholder wordlist pair — docs/02 specs a curated 2,048-entry pair, swappable
+  later as a data change), `accounts::trust` (L0–L3 enum, always L0 today — the ramp logic
+  isn't implemented), and `accounts::store` (`AccountStore` trait + in-memory impl) all work
+  end-to-end, covered by an axum-`Router`-level integration test (`api::tests`, driven via
+  `tower::ServiceExt::oneshot`) that registers an account, fetches and exhausts its
+  one-time prekey, and reroll-authenticates with a real libsignal identity-key signature.
+  `ingress::reputation` provides IP-bucketing (daily-rotating HMAC, never stores or forwards
+  the IP itself) and strike-based CAPTCHA/review escalation; CAPTCHA verification itself is
+  a `CaptchaVerifier` trait with only a test stub (`NullCaptchaVerifier`) — no real provider
+  wired in. Storage is in-memory only; a Postgres-backed `AccountStore` is the natural next
+  step. `admin`, `auth`, `blobs`, `delivery`, `halls`, `mls_ds`, `moderation`, `policy` are
+  still stubs.
+- **`cue-kt`, `cue-core`, `cue-testkit`** — stubs / scaffolding only. `cue-core`'s
+  `Command`/`Event` enums are intentionally empty.
 
 ## Commands
 
@@ -102,14 +120,18 @@ cue-core  (client core, GPL-3.0)          cue-node  (server, AGPL-3.0)
   Bound by Electron (NAPI-RS), web (wasm-bindgen), and eventually mobile (UniFFI) — see
   ADR-0007. `#[non_exhaustive]`, versioned types throughout: an old shell must fail closed
   against a newer core, not guess.
-- **`cue-node`** — the server (AGPL-3.0), one binary / one Postgres DB / one object store.
-  Submodules under `crates/cue-node/src/` (`accounts`, `admin`, `auth`, `blobs`,
-  `delivery`, `halls`, `ingress`, `mls_ds`, `moderation`, `policy`) each carry a doc comment
-  stating what that module must never do — e.g. `ingress` must never forward a client IP
-  past itself or write a request-level access log; `delivery` must never grow a durable
-  archive (envelopes are deleted on ack, hard 30-day TTL otherwise); `auth` must never let
-  issuance and spend of a token be correlated. Preserve these invariants when touching
-  these modules — they are the mechanism, not aspirational.
+- **`cue-node`** — the server (AGPL-3.0), one binary / one Postgres DB / one object store
+  (Postgres isn't wired yet — see Implementation status above; the registration slice runs
+  entirely in-memory). Submodules under `crates/cue-node/src/` (`accounts`, `admin`, `auth`,
+  `blobs`, `delivery`, `halls`, `ingress`, `mls_ds`, `moderation`, `policy`) each carry a doc
+  comment stating what that module must never do — e.g. `ingress` must never forward a
+  client IP past itself or write a request-level access log (its `reputation` submodule is
+  the one deliberate exception: it takes an `IpAddr` in and returns only an opaque,
+  daily-rotating bucket key out); `delivery` must never grow a durable archive (envelopes
+  are deleted on ack, hard 30-day TTL otherwise); `auth` must never let issuance and spend
+  of a token be correlated. Preserve these invariants when touching these modules — they
+  are the mechanism, not aspirational. `accounts`'s own invariant (never map a handle to a
+  person) is likewise load-bearing, not aspirational.
 - **`cue-testkit`** — protocol conformance suite (any future client must pass it) plus the
   traffic-analysis harness that asserts envelope sizes are uniform within a bucket and
   Quiet Mode timing is indistinguishable from idle (Phase 3+, then runs in CI forever).

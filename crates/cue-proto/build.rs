@@ -2,7 +2,10 @@ use std::path::Path;
 
 fn main() {
     let proto_dir = Path::new("proto");
-    let protos = [proto_dir.join("envelope.proto")];
+    let protos = [
+        proto_dir.join("envelope.proto"),
+        proto_dir.join("registration.proto"),
+    ];
 
     // protox is a pure-Rust protobuf parser: no system `protoc` install
     // required to build this workspace.

@@ -9,6 +9,7 @@
 
 mod accounts;
 mod admin;
+mod api;
 mod auth;
 mod blobs;
 mod delivery;
@@ -18,10 +19,36 @@ mod mls_ds;
 mod moderation;
 mod policy;
 
-fn main() {
-    todo!(
-        "cue-node has no runtime yet — Phase 1 (docs/11) wires ingress, \
-         accounts, and delivery into an axum server. This binary exists so \
-         the workspace builds end to end from the first commit."
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use accounts::store::InMemoryAccountStore;
+use api::{AppState, NullCaptchaVerifier, RegistrationConfig};
+
+#[tokio::main]
+async fn main() {
+    // In-memory only, matching cue-crypto::sessions's own starting point —
+    // a Postgres-backed AccountStore is the natural next step (docs/05),
+    // and NullCaptchaVerifier is a placeholder for a real provider
+    // (hCaptcha/Turnstile) that Phase 1's registration slice doesn't wire in.
+    let state = Arc::new(AppState::new(
+        Box::new(InMemoryAccountStore::new()),
+        Box::new(NullCaptchaVerifier),
+        RegistrationConfig::default(),
+    ));
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8443")
+        .await
+        .expect("bind registration listener");
+    tracing::info!(
+        addr = %listener.local_addr().expect("listener has a local address"),
+        "cue-node listening"
     );
+
+    axum::serve(
+        listener,
+        api::router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .expect("axum server error");
 }
