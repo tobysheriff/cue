@@ -13,6 +13,7 @@
 
 use argon2::Params;
 use cue_core::session::SessionManager;
+use cue_core::store::{EncryptedStore, StoreKey};
 use cue_core::transport::{bundle_from_response, open_received, seal_for_delivery, NodeClient};
 use cue_crypto::sessions::{generate_prekeys, DeviceId, Identity, ProtocolAddress};
 use cue_node::accounts::pow::{self, ChallengeId, PowChallenge};
@@ -151,7 +152,9 @@ async fn register_client(http: &reqwest::Client, base_url: &str) -> RegisteredCl
     let response = RegisterResponse::decode(register_response.bytes().await.unwrap()).unwrap();
 
     let address = ProtocolAddress::new(response.handle.clone(), DeviceId::new(1).unwrap());
-    let mut session = SessionManager::new(&identity, address.clone()).unwrap();
+    let store = EncryptedStore::create(":memory:", &StoreKey::from_bytes([0x24; 32]), &identity)
+        .expect("an in-memory store always opens");
+    let mut session = SessionManager::new(store, address.clone());
     session.register_own_prekeys(&prekeys).await.unwrap();
 
     RegisteredClient {
