@@ -46,6 +46,25 @@ must never do before touching it.
   implemented for `InMemSignalProtocolStore` (this crate's own fast unit test, still
   in-memory) and for `cue-core`'s `EncryptedStore` (real persistence, see below).
   This crate itself still never depends on a storage engine.
+- **`cue-crypto::recovery`** — real: `RecoveryPhrase` (docs/02 "Recovery"), the sole account
+  recovery mechanism. `generate` produces a standard 24-word/256-bit English BIP39 phrase —
+  docs/02 says "40-word... ~256 bits", but standard BIP39 ties word count to entropy
+  precisely (24 words at 11 bits/word for 256 bits), so this uses the audited off-the-shelf
+  wordlist rather than a bespoke 40-word encoding invented to match the doc literally
+  (deliberate reconciliation, not a bug). `parse` restores from user-entered text and
+  rejects a bad BIP39 checksum (almost always a mistyped word) instead of silently
+  deriving the wrong identity. `to_identity` deterministically re-derives a `sessions::
+  Identity`: the phrase's BIP39 seed is run through HKDF-SHA256 (domain-separated from
+  BIP39's own HD-wallet derivation purpose) to seed a `ChaCha20Rng`, which
+  `Identity::generate` then consumes exactly as it would any other `Rng + CryptoRng` —
+  same phrase always yields the same identity (and registration id). `bip39`'s `zeroize`
+  feature wipes the phrase/entropy on drop. Tested: word count, parse round-trip,
+  determinism, distinct phrases yield distinct identities, and a tampered phrase is
+  rejected at parse time. Not yet wired into a real registration/restore flow —
+  `EncryptedStore::create`/`open` (see `cue-core` below) already accept any `Identity`
+  regardless of how it was produced, but there is no account-creation flow to call them
+  from yet (`Identity::generate` itself is still test-only in `cue-core`); that lands with
+  the Electron shell.
 - **`cue-crypto::groups`, `::credentials`, `::franking`** — stubs (`NotImplemented`).
 - **`cue-proto`** — real: `Envelope`/`SizeBucket` wire types (`Envelope` now carries an
   `envelope_id`, assigned by `delivery` on enqueue for dedup/ack — never set by the sender),
