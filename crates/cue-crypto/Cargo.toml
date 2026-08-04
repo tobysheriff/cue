@@ -18,6 +18,15 @@ rand = "0.9"
 libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.3", features = [
     "mlkem1024",
 ] }
+# recovery.rs (docs/02 "Recovery"): standard 24-word/256-bit English BIP39,
+# `zeroize` so the phrase and its entropy are wiped on drop rather than left
+# in memory. hkdf/sha2/rand_chacha derive a device identity from the phrase
+# deterministically — versions pinned to what libsignal-protocol's own
+# dependency tree already resolves, to avoid a duplicate-version warning.
+bip39 = { version = "2.2.2", features = ["zeroize"] }
+hkdf = "0.12"
+sha2 = "0.10"
+rand_chacha = "0.9"
 
 [dev-dependencies]
 tokio = { workspace = true }

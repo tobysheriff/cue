@@ -14,6 +14,11 @@
 /// (docs/03 "Direct messages"). Wraps `libsignal-protocol`.
 pub mod sessions;
 
+/// Recovery phrase generation and restore (docs/02 "Recovery"): the sole
+/// account recovery mechanism, deterministically re-deriving a device's
+/// long-term identity key.
+pub mod recovery;
+
 /// MLS group sessions via `openmls` (docs/03 "Encrypted groups", ADR-0003).
 /// TreeKEM ratchet tree, 20-member default cap enforced by the client.
 pub mod groups;
@@ -36,6 +41,9 @@ pub mod franking;
 pub enum CryptoError {
     #[error("operation not yet implemented: {0}")]
     NotImplemented(&'static str),
+
+    #[error("invalid recovery phrase: {0}")]
+    InvalidRecoveryPhrase(String),
 
     #[error(transparent)]
     Signal(#[from] libsignal_protocol::SignalProtocolError),
