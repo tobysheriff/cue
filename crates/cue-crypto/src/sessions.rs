@@ -8,34 +8,87 @@
 //! reaches into ratchet, KEM, or AEAD internals — every cryptographic
 //! operation below is a direct call into `libsignal_protocol`.
 //!
-//! Storage is in-memory only, via `libsignal_protocol::InMemSignalProtocolStore`,
-//! until `cue-core`'s encrypted local store lands (docs/06 "Local storage").
-//! Functions here take that concrete type rather than a generic store trait
-//! because libsignal's own API requires disjoint `&mut store.session_store` /
-//! `&mut store.identity_store` field borrows — which only work against a
-//! concrete struct, not a `&mut dyn ProtocolStore` trait object (two
-//! simultaneous mutable borrows of one trait object don't type-check even
-//! though the underlying fields are disjoint). When `cue-core` needs
-//! persistence, it will re-implement `InMemSignalProtocolStore`'s fields as
-//! its own encrypted-store equivalents; this module's signatures will
-//! change to match at that point rather than being generalised early.
+//! Storage is generic over [`ProtocolStoreParts`]: functions here take
+//! `&mut S` for any store implementing it rather than a concrete type,
+//! because libsignal's own API requires disjoint `&mut store.session_store`
+//! / `&mut store.identity_store` field borrows passed as separate arguments
+//! — which only work against a concrete struct's named fields, not a
+//! `&mut dyn ProtocolStore` trait object (two simultaneous mutable borrows
+//! of one trait object don't type-check even though the underlying fields
+//! are disjoint). `ProtocolStoreParts::parts_mut` is how a concrete store
+//! exposes that disjointness generically: implemented here for
+//! [`InMemSignalProtocolStore`] (this crate's own round-trip test, below),
+//! and by `cue-core`'s encrypted local store (docs/06 "Local storage") for
+//! everything else — this module stays ignorant of which, and in
+//! particular never depends on `cue-core` or a storage engine.
 
 use std::time::SystemTime;
 
 pub use libsignal_protocol::kem;
+use libsignal_protocol::KeyPair;
 pub use libsignal_protocol::{
-    CiphertextMessage, CiphertextMessageType, DeviceId, IdentityKey, IdentityKeyPair,
-    InMemSignalProtocolStore, KyberPreKeyId, KyberPreKeyRecord, PreKeyBundle, PreKeyId,
-    PreKeyRecord, PreKeySignalMessage, ProtocolAddress, PublicKey, SignalMessage, SignedPreKeyId,
-    SignedPreKeyRecord, Timestamp,
-};
-use libsignal_protocol::{
-    GenericSignedPreKey as _, KeyPair, KyberPreKeyStore as _, PreKeyStore as _,
-    SignedPreKeyStore as _,
+    CiphertextMessage, CiphertextMessageType, DeviceId, Direction, GenericSignedPreKey,
+    IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore, InMemSignalProtocolStore,
+    KyberPreKeyId, KyberPreKeyRecord, KyberPreKeyStore, PreKeyBundle, PreKeyId, PreKeyRecord,
+    PreKeySignalMessage, PreKeyStore, ProtocolAddress, PublicKey, SessionRecord, SessionStore,
+    SignalMessage, SignalProtocolError, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore,
+    Timestamp,
 };
 use rand::{CryptoRng, Rng};
 
 use crate::CryptoError;
+
+/// A store type usable by this module's functions — see the module doc for
+/// why this exists instead of a plain `&mut dyn ProtocolStore`. `parts_mut`
+/// is called once per function here and must hand back five genuinely
+/// disjoint borrows (sound to implement directly against a struct's named
+/// fields, as [`InMemSignalProtocolStore`]'s impl below does; not soundly
+/// implementable against anything that needs to synthesize the borrows,
+/// e.g. through a lock).
+pub trait ProtocolStoreParts {
+    type Session: SessionStore;
+    type Identity: IdentityKeyStore;
+    type PreKey: PreKeyStore;
+    type SignedPreKey: SignedPreKeyStore;
+    type KyberPreKey: KyberPreKeyStore;
+
+    #[allow(clippy::type_complexity)]
+    fn parts_mut(
+        &mut self,
+    ) -> (
+        &mut Self::Session,
+        &mut Self::Identity,
+        &mut Self::PreKey,
+        &mut Self::SignedPreKey,
+        &mut Self::KyberPreKey,
+    );
+}
+
+impl ProtocolStoreParts for InMemSignalProtocolStore {
+    type Session = libsignal_protocol::InMemSessionStore;
+    type Identity = libsignal_protocol::InMemIdentityKeyStore;
+    type PreKey = libsignal_protocol::InMemPreKeyStore;
+    type SignedPreKey = libsignal_protocol::InMemSignedPreKeyStore;
+    type KyberPreKey = libsignal_protocol::InMemKyberPreKeyStore;
+
+    fn parts_mut(
+        &mut self,
+    ) -> (
+        &mut Self::Session,
+        &mut Self::Identity,
+        &mut Self::PreKey,
+        &mut Self::SignedPreKey,
+        &mut Self::KyberPreKey,
+    ) {
+        (
+            &mut self.session_store,
+            &mut self.identity_store,
+            &mut self.pre_key_store,
+            &mut self.signed_pre_key_store,
+            &mut self.kyber_pre_key_store,
+        )
+    }
+}
 
 /// Prekey buffer size and rotation cadence (docs/02 "Prekeys", docs/03
 /// "Implementation"). Cue's own decision, not libsignal's — a Node may tune
@@ -78,8 +131,9 @@ impl Identity {
         }
     }
 
-    /// A fresh in-memory session store for this identity. Temporary until
-    /// `cue-core`'s encrypted local store lands (docs/06).
+    /// A fresh in-memory session store for this identity — this crate's own
+    /// tests only; `cue-core` uses its encrypted local store instead
+    /// (docs/06 "Local storage").
     pub fn new_store(&self) -> Result<InMemSignalProtocolStore, CryptoError> {
         Ok(InMemSignalProtocolStore::new(
             self.key_pair,
@@ -168,20 +222,18 @@ pub fn generate_prekeys<R: Rng + CryptoRng>(
 /// private halves must be saved locally *before* the public `bundle` is
 /// published — publishing first would let a peer's handshake reference
 /// prekeys this device can't yet answer with).
-pub async fn save_generated_prekeys(
-    store: &mut InMemSignalProtocolStore,
+pub async fn save_generated_prekeys<S: ProtocolStoreParts>(
+    store: &mut S,
     prekeys: &GeneratedPrekeys,
 ) -> Result<(), CryptoError> {
-    store
-        .pre_key_store
+    let (_, _, pre_key_store, signed_pre_key_store, kyber_pre_key_store) = store.parts_mut();
+    pre_key_store
         .save_pre_key(prekeys.one_time_prekey.0, &prekeys.one_time_prekey.1)
         .await?;
-    store
-        .signed_pre_key_store
+    signed_pre_key_store
         .save_signed_pre_key(prekeys.signed_prekey.0, &prekeys.signed_prekey.1)
         .await?;
-    store
-        .kyber_pre_key_store
+    kyber_pre_key_store
         .save_kyber_pre_key(prekeys.kyber_prekey.0, &prekeys.kyber_prekey.1)
         .await?;
     Ok(())
@@ -192,19 +244,20 @@ pub async fn save_generated_prekeys(
 /// an ML-KEM-1024 encapsulation, both mixed into the root key for
 /// harvest-now-decrypt-later resistance. After this returns,
 /// [`encrypt_message`] can be called for `remote_address`.
-pub async fn establish_session<R: Rng + CryptoRng>(
-    store: &mut InMemSignalProtocolStore,
+pub async fn establish_session<S: ProtocolStoreParts, R: Rng + CryptoRng>(
+    store: &mut S,
     local_address: &ProtocolAddress,
     remote_address: &ProtocolAddress,
     bundle: &PreKeyBundle,
     now: SystemTime,
     csprng: &mut R,
 ) -> Result<(), CryptoError> {
+    let (session_store, identity_store, _, _, _) = store.parts_mut();
     libsignal_protocol::process_prekey_bundle(
         remote_address,
         local_address,
-        &mut store.session_store,
-        &mut store.identity_store,
+        session_store,
+        identity_store,
         bundle,
         now,
         csprng,
@@ -216,20 +269,21 @@ pub async fn establish_session<R: Rng + CryptoRng>(
 /// Encrypt `plaintext` for `remote_address` under the Double Ratchet,
 /// wrapping it in a fresh PQXDH handshake message if the session hasn't yet
 /// received a response (docs/03 "Ongoing messages: Double Ratchet").
-pub async fn encrypt_message<R: Rng + CryptoRng>(
-    store: &mut InMemSignalProtocolStore,
+pub async fn encrypt_message<S: ProtocolStoreParts, R: Rng + CryptoRng>(
+    store: &mut S,
     local_address: &ProtocolAddress,
     remote_address: &ProtocolAddress,
     plaintext: &[u8],
     now: SystemTime,
     csprng: &mut R,
 ) -> Result<CiphertextMessage, CryptoError> {
+    let (session_store, identity_store, _, _, _) = store.parts_mut();
     let message = libsignal_protocol::message_encrypt(
         plaintext,
         remote_address,
         local_address,
-        &mut store.session_store,
-        &mut store.identity_store,
+        session_store,
+        identity_store,
         now,
         csprng,
     )
@@ -240,22 +294,24 @@ pub async fn encrypt_message<R: Rng + CryptoRng>(
 /// Decrypt a message from `remote_address`, transparently completing an
 /// inbound PQXDH handshake (docs/03) if `ciphertext` is the first message of
 /// a new session.
-pub async fn decrypt_message<R: Rng + CryptoRng>(
-    store: &mut InMemSignalProtocolStore,
+pub async fn decrypt_message<S: ProtocolStoreParts, R: Rng + CryptoRng>(
+    store: &mut S,
     local_address: &ProtocolAddress,
     remote_address: &ProtocolAddress,
     ciphertext: &CiphertextMessage,
     csprng: &mut R,
 ) -> Result<Vec<u8>, CryptoError> {
+    let (session_store, identity_store, pre_key_store, signed_pre_key_store, kyber_pre_key_store) =
+        store.parts_mut();
     let plaintext = libsignal_protocol::message_decrypt(
         ciphertext,
         remote_address,
         local_address,
-        &mut store.session_store,
-        &mut store.identity_store,
-        &mut store.pre_key_store,
-        &store.signed_pre_key_store,
-        &mut store.kyber_pre_key_store,
+        session_store,
+        identity_store,
+        pre_key_store,
+        &*signed_pre_key_store,
+        kyber_pre_key_store,
         csprng,
     )
     .await?;
