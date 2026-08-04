@@ -38,9 +38,14 @@ must never do before touching it.
   published key bytes — the receiving side of `generate_prekeys`, used once those bytes
   have crossed the wire) all work end-to-end (round-trip test in `sessions.rs` — Alice and
   Bob complete a handshake and exchange messages; also exercised for real by
-  `cue-testkit`'s two-clients-plus-Node test). Storage is in-memory only
-  (`libsignal_protocol::InMemSignalProtocolStore`); persistence is `cue-core`'s job
-  (docs/06) and isn't wired yet.
+  `cue-testkit`'s two-clients-plus-Node test). Storage is generic over a new
+  `ProtocolStoreParts` trait (exposes a store's disjoint sub-stores via one
+  `parts_mut` call, since libsignal's own free functions need several simultaneous
+  `&mut` sub-store borrows that only type-check against a concrete struct's named
+  fields, not a trait object) rather than hard-coding `InMemSignalProtocolStore` —
+  implemented for `InMemSignalProtocolStore` (this crate's own fast unit test, still
+  in-memory) and for `cue-core`'s `EncryptedStore` (real persistence, see below).
+  This crate itself still never depends on a storage engine.
 - **`cue-crypto::groups`, `::credentials`, `::franking`** — stubs (`NotImplemented`).
 - **`cue-proto`** — real: `Envelope`/`SizeBucket` wire types (`Envelope` now carries an
   `envelope_id`, assigned by `delivery` on enqueue for dedup/ack — never set by the sender),
@@ -132,8 +137,31 @@ must never do before touching it.
   server's live fan-out branch, not its connect-time queue flush; acks over the socket
   itself rather than the HTTP endpoint).
 
-  Not yet built: the encrypted local store (docs/06 "Local storage"), KT verification, and
-  group sessions/MLS.
+  Not yet built: KT verification and group sessions/MLS.
+
+  `store` (new) is the encrypted local store (docs/06 "Local storage and ephemerality",
+  docs/03 "Local storage encryption"): `EncryptedStore`, a SQLCipher-backed (`rusqlite`,
+  `bundled-sqlcipher-vendored-openssl` — vendors SQLCipher *and* OpenSSL from source, no
+  new system dependency, matching this workspace's existing reproducible-build rationale)
+  replacement for `InMemSignalProtocolStore` that persists identity, sessions, and prekeys
+  across restarts, implementing `cue_crypto::sessions::ProtocolStoreParts` so it plugs
+  straight into the same functions `SessionManager` already called. Keyed by a random
+  256-bit key held in the OS keychain (`keyring` crate; macOS Keychain / Windows Credential
+  Manager / Linux Secret Service via `zbus`) via `StoreKeySource`/`OsKeychainKeySource` —
+  `EncryptedStore::create`/`open` take the key directly, so tests never touch a real
+  keychain (`cargo test` uses a fixed test key, exercising the exact same SQL/trait-impl
+  code as production including SQLite's special `":memory:"` connection string for
+  zero-disk-I/O speed). `SessionManager::new` now takes an already-opened `EncryptedStore`
+  instead of building an in-memory one itself — the caller (still just tests; no shell
+  exists yet) is responsible for `create` on first run vs. `open` on restart. `Core`,
+  `Command`, and `Event` needed no changes. Tested with a real temp-dir-backed store closed
+  and reopened mid-test (session and prekey state survive), a wrong-key-must-fail-not-
+  corrupt test, and a manual check that the on-disk file has no plaintext SQLite header.
+  **Deliberate, tracked Phase 1 scope**, matching `SealedSenderStub`'s precedent: no
+  optional Argon2id app-lock passphrase (docs/03's other keying mode), no "panic wipe," no
+  ephemerality timers or secure-deletion vacuum, no local search index — each is Phase 2
+  polish (docs/11: "Retention windows, expiry enforcement in core, secure deletion"), not
+  this slice's job.
 - **`cue-kt`** — stub / scaffolding only.
 - **`cue-testkit`** — `size_bucket_for` is real (the docs/04 1/4/16/64 KB mapping — an
   independent reference implementation, not one `cue-core`'s `transport` calls into, so it
@@ -170,6 +198,14 @@ require a system `protoc` (its `spqr` sub-dependency shells out to it): install
 the pinned tag is a deliberate, reviewed change, not a routine update — re-check
 `deny.toml`'s licence allow-list, `sources.allow-git`, and the advisory `ignore` entry
 against the new tag's dependency tree (`cargo deny check`) before merging a bump.
+
+`cue-core`'s `rusqlite` dependency (the encrypted local store) uses the
+`bundled-sqlcipher-vendored-openssl` feature: it compiles SQLCipher and OpenSSL from
+vendored C source rather than linking a system library, so a clean build of `cue-core`
+takes noticeably longer than the rest of the workspace — no new system dependency to
+install, just build time. Pinned to `rusqlite` 0.33, not latest: 0.40's `libsqlite3-sys`
+build script uses the still-unstable `cfg_select!` std macro and fails to compile on
+stable rustc.
 
 ## Workspace architecture
 
