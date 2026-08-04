@@ -31,6 +31,13 @@ pub mod session;
 /// comment for why.
 pub mod transport;
 
+/// The encrypted local store (docs/06 "Local storage and ephemerality"): a
+/// SQLCipher-backed replacement for `InMemSignalProtocolStore` that
+/// persists identity, sessions, and prekeys across restarts. See its own
+/// module doc for what's implemented here versus deferred to a later
+/// phase.
+pub mod store;
+
 use session::SessionManager;
 
 /// Commands a shell can issue to the core. Covers 1:1 session
@@ -146,6 +153,8 @@ impl std::fmt::Debug for Event {
 pub enum CoreError {
     #[error(transparent)]
     Crypto(#[from] cue_crypto::CryptoError),
+    #[error(transparent)]
+    Store(#[from] store::StoreError),
 }
 
 /// The `Command`-in/`Event`-out actor (docs/06). `Core::spawn` starts it on
@@ -252,9 +261,15 @@ mod tests {
     use rand::TryRngCore as _;
 
     use super::*;
+    use crate::store::{EncryptedStore, StoreKey};
 
     fn address(name: &str) -> ProtocolAddress {
         ProtocolAddress::new(name.to_owned(), DeviceId::new(1).unwrap())
+    }
+
+    fn test_store(identity: &Identity) -> EncryptedStore {
+        EncryptedStore::create(":memory:", &StoreKey::from_bytes([0x24; 32]), identity)
+            .expect("an in-memory store always opens")
     }
 
     #[tokio::test]
@@ -274,12 +289,12 @@ mod tests {
         )
         .unwrap();
 
-        let mut bob_session = SessionManager::new(&bob_identity, address("bob")).unwrap();
+        let mut bob_session = SessionManager::new(test_store(&bob_identity), address("bob"));
         bob_session
             .register_own_prekeys(&bob_prekeys)
             .await
             .unwrap();
-        let alice_session = SessionManager::new(&alice_identity, address("alice")).unwrap();
+        let alice_session = SessionManager::new(test_store(&alice_identity), address("alice"));
 
         let (alice_tx, mut alice_rx) = Core::spawn(alice_session);
         let (bob_tx, mut bob_rx) = Core::spawn(bob_session);
@@ -354,7 +369,7 @@ mod tests {
     async fn a_failed_command_reports_command_failed_and_does_not_kill_the_actor() {
         let mut csprng = OsRng.unwrap_err();
         let alice_identity = Identity::generate(&mut csprng);
-        let alice_session = SessionManager::new(&alice_identity, address("alice")).unwrap();
+        let alice_session = SessionManager::new(test_store(&alice_identity), address("alice"));
         let (alice_tx, mut alice_rx) = Core::spawn(alice_session);
 
         // No session and no bundle for "ghost" — this must fail, not

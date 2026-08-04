@@ -2,40 +2,40 @@
 //! Double Ratchet handshake, wrapping `cue_crypto::sessions` with the
 //! shapes the `Command`/`Event` actor (`crate::Core`) drives it with.
 //!
-//! Storage is in-memory only, same as `cue_crypto::sessions` itself
-//! (`InMemSignalProtocolStore`) — the encrypted local store (docs/06
-//! "Local storage and ephemerality") is separate, not-yet-started work. A
-//! session established here does not survive the process exiting.
+//! Storage is `crate::store::EncryptedStore`, the encrypted local store
+//! (docs/06 "Local storage and ephemerality") — a session established here
+//! survives the process exiting. The caller is responsible for opening or
+//! creating that store first (`EncryptedStore::create` on first run,
+//! `EncryptedStore::open` on restart) and passing it in already built,
+//! since only the caller knows which of those two cases applies.
 
 use std::time::SystemTime;
 
 use cue_crypto::sessions::{
-    self, CiphertextMessage, GeneratedPrekeys, Identity, InMemSignalProtocolStore, PreKeyBundle,
-    ProtocolAddress,
+    self, CiphertextMessage, GeneratedPrekeys, PreKeyBundle, ProtocolAddress,
 };
 use rand::rngs::OsRng;
 use rand::TryRngCore as _;
 
+use crate::store::EncryptedStore;
 use crate::CoreError;
 
-/// One device's live session state: the libsignal store holding every peer
+/// One device's live session state: the encrypted store holding every peer
 /// session it has established, and the address peers use to reach it
-/// (docs/03 "Direct messages"). Everything here is in-memory only (see
-/// module doc) — a fresh `SessionManager` has forgotten every session a
-/// previous process instance built.
+/// (docs/03 "Direct messages").
 pub struct SessionManager {
     local_address: ProtocolAddress,
-    store: InMemSignalProtocolStore,
+    store: EncryptedStore,
 }
 
 impl SessionManager {
-    /// Build a fresh session store for `identity`, addressed as
+    /// Wrap an already-opened `store` (see module doc), addressed as
     /// `local_address` (docs/02: `(handle, device_id)` pair).
-    pub fn new(identity: &Identity, local_address: ProtocolAddress) -> Result<Self, CoreError> {
-        Ok(Self {
+    pub fn new(store: EncryptedStore, local_address: ProtocolAddress) -> Self {
+        Self {
             local_address,
-            store: identity.new_store()?,
-        })
+            store,
+        }
     }
 
     /// Save this device's own generated prekeys locally, before the public
@@ -114,10 +114,16 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cue_crypto::sessions::{generate_prekeys, DeviceId};
+    use crate::store::StoreKey;
+    use cue_crypto::sessions::{generate_prekeys, DeviceId, Identity};
 
     fn address(name: &str) -> ProtocolAddress {
         ProtocolAddress::new(name.to_owned(), DeviceId::new(1).unwrap())
+    }
+
+    fn test_store(identity: &Identity) -> EncryptedStore {
+        EncryptedStore::create(":memory:", &StoreKey::from_bytes([0x24; 32]), identity)
+            .expect("an in-memory store always opens")
     }
 
     #[tokio::test]
@@ -127,8 +133,8 @@ mod tests {
         let alice_identity = Identity::generate(&mut csprng);
         let bob_identity = Identity::generate(&mut csprng);
 
-        let mut alice = SessionManager::new(&alice_identity, address("alice")).unwrap();
-        let mut bob = SessionManager::new(&bob_identity, address("bob")).unwrap();
+        let mut alice = SessionManager::new(test_store(&alice_identity), address("alice"));
+        let mut bob = SessionManager::new(test_store(&bob_identity), address("bob"));
 
         let bob_prekeys = generate_prekeys(
             &bob_identity,
@@ -173,7 +179,7 @@ mod tests {
     async fn sending_without_an_established_session_fails_rather_than_silently_no_opping() {
         let mut csprng = OsRng.unwrap_err();
         let alice_identity = Identity::generate(&mut csprng);
-        let mut alice = SessionManager::new(&alice_identity, address("alice")).unwrap();
+        let mut alice = SessionManager::new(test_store(&alice_identity), address("alice"));
 
         let result = alice.send(&address("bob"), b"hello?").await;
 

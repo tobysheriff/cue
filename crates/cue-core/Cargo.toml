@@ -23,3 +23,31 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # `reqwest` above — no TLS feature enabled here yet.
 tokio-tungstenite = "0.29"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# The encrypted local store (docs/06 "Local storage"). `bundled-sqlcipher-vendored-openssl`
+# vendors SQLCipher's *and* OpenSSL's C source and builds both from scratch — a slower
+# build than linking a system libsqlcipher, but zero new system dependency and a
+# reproducible build (docs/11 Phase 0), matching the same "boring, auditable" rationale
+# `reqwest`/rustls above already follows rather than trusting whatever TLS/crypto stack
+# happens to be on the host. Pinned to 0.33, not latest: `rusqlite` 0.40's
+# `libsqlite3-sys` build script uses the still-unstable `cfg_select!` std macro and fails
+# to compile on stable rustc.
+rusqlite = { version = "0.33", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
+# OS keychain access for the local store's key (docs/03: "a random key stored in the OS
+# keychain" when app-lock is off — the only mode this Phase 1 slice implements). Default
+# features already cover macOS Keychain, Windows Credential Manager, and Linux Secret
+# Service (via `zbus`, pure Rust, no libdbus) — no extra feature selection needed. Only
+# `OsKeychainKeySource` calls into this; `cargo test` never does, so CI doesn't need a
+# live OS keychain or D-Bus session available.
+keyring = "4"
+# Explicit zeroisation of key material (docs/03 "Local storage encryption"); relied on for
+# `StoreKey`, not for key material `libsignal-protocol` itself already owns.
+zeroize = "1"
+# `libsignal_protocol`'s store traits are themselves `#[async_trait(?Send)]` (see
+# `session.rs`'s doc comment on why `Core::spawn` needs a `LocalSet`); implementing them
+# for `EncryptedStore`'s sub-stores requires the same macro on the impl blocks.
+async-trait = "0.1"
+
+[dev-dependencies]
+# Dev-only: proves the local store's actual point — that a session survives a process
+# restart — by reopening a real file-backed store from a temp directory.
+tempfile = "3"
